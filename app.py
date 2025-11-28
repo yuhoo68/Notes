@@ -1,10 +1,15 @@
+import base64
+import email
+import os
+import urllib.parse
 import streamlit.components.v1 as components
 from datetime import datetime
 
 import duckdb
 import pandas as pd
 import streamlit as st
-from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
+from bs4 import BeautifulSoup
+from st_aggrid import AgGrid, GridOptionsBuilder
 from streamlit_quill import st_quill
 
 DB_PATH = "onenote.duckdb"
@@ -212,6 +217,25 @@ def create_page(con: duckdb.DuckDBPyConnection, section_id: int) -> int:
     return page_id
 
 
+def insert_page_with_content(
+    con: duckdb.DuckDBPyConnection, section_id: int, title: str, body_html: str
+) -> int:
+    """Insert a page with provided content into a section."""
+    now = datetime.now()
+    page_id = (
+        con.execute(
+            "SELECT COALESCE(MAX(id), 0) + 1 FROM pages"
+        ).fetchone()[0]
+    )
+    con.execute(
+        "INSERT INTO pages (id, section_id, title, body_html, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        [page_id, section_id, title.strip() or "Untitled", body_html, now, now],
+    )
+    con.commit()
+    return page_id
+
+
 def update_page(
     con: duckdb.DuckDBPyConnection, page_id: int, title: str, body_html: str
 ) -> None:
@@ -226,6 +250,103 @@ def update_page(
 def delete_page(con: duckdb.DuckDBPyConnection, page_id: int) -> None:
     con.execute("DELETE FROM pages WHERE id = ?", [page_id])
     con.commit()
+
+
+def html_to_body(text: str, fallback_title: str):
+    """Extract title and body HTML from raw HTML text."""
+    soup = BeautifulSoup(text, "html.parser")
+    title = soup.title.string.strip() if soup.title and soup.title.string else fallback_title
+    body = str(soup.body or soup)
+    return title, body
+
+
+def parse_mht_to_html(data: bytes, filename: str):
+    """Parse .mht, inline referenced resources, return (title, body_html)."""
+    msg = email.message_from_bytes(data)
+    html_part = None
+    resources: list[tuple[str, bytes, str | None, str | None]] = []
+
+    for part in msg.walk():
+        ctype = part.get_content_type()
+        if ctype == "text/html" and html_part is None:
+            charset = part.get_content_charset() or "utf-8"
+            html_part = part.get_payload(decode=True).decode(charset, errors="replace")
+        else:
+            cid = part.get("Content-ID")
+            loc = part.get("Content-Location")
+            payload = part.get_payload(decode=True) or b""
+            if cid or loc:
+                resources.append((ctype, payload, cid, loc))
+
+    if not html_part:
+        raise ValueError(f"No HTML part found in {filename}")
+
+    def norm(val: str) -> str:
+        val = urllib.parse.unquote(val or "").strip()
+        val = val.replace("\\", "/")
+        if val.lower().startswith("cid:"):
+            val = "cid:" + val[4:]
+        return val
+
+    # Build map from possible src values to data URLs
+    src_map: dict[str, str] = {}
+    for ctype, content, cid, loc in resources:
+        data_url = f"data:{ctype};base64,{base64.b64encode(content).decode()}"
+        if cid:
+            cid_clean = cid.strip("<>")
+            for key in (
+                f"cid:{cid_clean}",
+                f"CID:{cid_clean}",
+                cid_clean,
+                norm(cid_clean),
+            ):
+                src_map[key] = data_url
+        if loc:
+            loc_clean = loc.strip().strip("<>")
+            normalized = norm(loc_clean)
+            for key in (
+                loc_clean,
+                f"cid:{loc_clean}",
+                f"CID:{loc_clean}",
+                normalized,
+            ):
+                src_map[key] = data_url
+            basename = os.path.basename(normalized)
+            if basename:
+                for key in (
+                    basename,
+                    f"cid:{basename}",
+                    f"CID:{basename}",
+                    norm(basename),
+                ):
+                    src_map[key] = data_url
+
+    soup = BeautifulSoup(html_part, "html.parser")
+    for tag in soup.find_all(src=True):
+        src_val = tag.get("src", "")
+        lookup = norm(src_val)
+        if lookup in src_map:
+            tag["src"] = src_map[lookup]
+        else:
+            # Try basename match
+            basename = os.path.basename(lookup)
+            if basename in src_map:
+                tag["src"] = src_map[basename]
+
+    title, body_html = html_to_body(str(soup), filename.rsplit(".", 1)[0])
+    return title, body_html
+
+
+def strip_data_uri_images(html: str) -> str:
+    """Remove data URI image sources to avoid huge payloads in the editor."""
+    soup = BeautifulSoup(html or "", "html.parser")
+    changed = False
+    for img in soup.find_all("img"):
+        src = img.get("src", "")
+        if src.startswith("data:"):
+            img["src"] = ""
+            changed = True
+    return str(soup) if changed else html
 
 
 def main():
@@ -278,6 +399,29 @@ def main():
                 create_section(con, selected_notebook_id, new_section_name)
                 st.rerun()
 
+        with st.sidebar.expander("Import .mht pages", expanded=False):
+            if not selected_section_id:
+                st.info("Сначала выберите раздел.")
+            else:
+                uploaded = st.file_uploader(
+                    "Выберите .mht файлы", type=["mht"], accept_multiple_files=True, key="mht_files"
+                )
+                if uploaded and st.button("Импортировать .mht", key="import_mht_btn"):
+                    imported = 0
+                    errors = []
+                    for file in uploaded:
+                        try:
+                            title, body_html = parse_mht_to_html(file.getvalue(), file.name)
+                            insert_page_with_content(con, selected_section_id, title, body_html)
+                            imported += 1
+                        except Exception as exc:
+                            errors.append(f"{file.name}: {exc}")
+                    if imported:
+                        st.success(f"Импортировано {imported} страниц")
+                        st.rerun()
+                    if errors:
+                        st.warning(";\n".join(errors))
+
     pages_df = load_pages_df(con, selected_notebook_id, selected_section_id)
 
     if selected_section_id and st.sidebar.button("➕ Новая страница"):
@@ -296,7 +440,7 @@ def main():
             df_display,
             gridOptions=gb.build(),
             enable_enterprise_modules=False,
-            update_mode=GridUpdateMode.SELECTION_CHANGED,
+            update_on=["selectionChanged"],
             height=400,
             fit_columns_on_grid_load=True,
         )
@@ -352,8 +496,9 @@ def main():
                     value=current_title,
                     key=f"title_{page_id}",
                 )
+                editable_html = strip_data_uri_images(current_html)
                 quill_html = st_quill(
-                    value=current_html,
+                    value=editable_html,
                     html=True,
                     placeholder="Начните писать...",
                     key=f"quill_{page_id}",
