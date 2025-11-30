@@ -13,6 +13,8 @@ from st_aggrid import AgGrid, GridOptionsBuilder
 from streamlit_quill import st_quill
 
 DB_PATH = "onenote.duckdb"
+DEFAULT_USER_LOGIN = "owner"
+DEFAULT_USER_NAME = "Owner"
 
 
 @st.cache_resource
@@ -23,14 +25,24 @@ def get_connection():
 
 
 def init_db(con: duckdb.DuckDBPyConnection) -> None:
-    """Create the OneNote-like schema and seed demo data. """
+    """Create the OneNote-like schema, apply simple migrations, and seed demo data."""
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            login TEXT PRIMARY KEY,
+            full_name TEXT NOT NULL
+        )
+        """
+    )
     con.execute(
         """
         CREATE TABLE IF NOT EXISTS notebooks (
             id INTEGER PRIMARY KEY,
             name TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_by TEXT REFERENCES users(login),
+            closed BOOLEAN DEFAULT FALSE
         )
         """
     )
@@ -41,7 +53,8 @@ def init_db(con: duckdb.DuckDBPyConnection) -> None:
             notebook_id INTEGER NOT NULL,
             name TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_by TEXT REFERENCES users(login)
         )
         """
     )
@@ -53,12 +66,56 @@ def init_db(con: duckdb.DuckDBPyConnection) -> None:
             title TEXT NOT NULL,
             body_html TEXT,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_by TEXT REFERENCES users(login)
+        )
+        """
+    )
+    con.execute(
+        """
+        CREATE TABLE IF NOT EXISTS notebook_owners (
+            notebook_id INTEGER NOT NULL,
+            user_login TEXT NOT NULL,
+            PRIMARY KEY (notebook_id, user_login),
+            FOREIGN KEY (notebook_id) REFERENCES notebooks(id),
+            FOREIGN KEY (user_login) REFERENCES users(login)
         )
         """
     )
 
+    # Lightweight migrations for existing databases.
+    con.execute("ALTER TABLE notebooks ADD COLUMN IF NOT EXISTS closed BOOLEAN DEFAULT FALSE")
+    con.execute("ALTER TABLE notebooks ADD COLUMN IF NOT EXISTS created_by TEXT")
+    con.execute("ALTER TABLE sections ADD COLUMN IF NOT EXISTS created_by TEXT")
+    con.execute("ALTER TABLE pages ADD COLUMN IF NOT EXISTS created_by TEXT")
+
+    con.execute(
+        "INSERT OR IGNORE INTO users (login, full_name) VALUES (?, ?)",
+        [DEFAULT_USER_LOGIN, DEFAULT_USER_NAME],
+    )
+    con.execute(
+        "UPDATE notebooks SET created_by = ? WHERE created_by IS NULL",
+        [DEFAULT_USER_LOGIN],
+    )
+    con.execute("UPDATE notebooks SET closed = FALSE WHERE closed IS NULL")
+    con.execute(
+        "UPDATE sections SET created_by = ? WHERE created_by IS NULL",
+        [DEFAULT_USER_LOGIN],
+    )
+    con.execute(
+        "UPDATE pages SET created_by = ? WHERE created_by IS NULL",
+        [DEFAULT_USER_LOGIN],
+    )
+    con.execute(
+        """
+        INSERT OR IGNORE INTO notebook_owners (notebook_id, user_login)
+        SELECT id, COALESCE(created_by, ?) FROM notebooks
+        """,
+        [DEFAULT_USER_LOGIN],
+    )
+
     if con.execute("SELECT COUNT(*) FROM notebooks").fetchone()[0] > 0:
+        con.commit()
         return
 
     now = datetime.now()
@@ -66,10 +123,15 @@ def init_db(con: duckdb.DuckDBPyConnection) -> None:
     notebook_ids: dict[str, int] = {}
     for idx, name in enumerate(notebooks, start=1):
         con.execute(
-            "INSERT INTO notebooks (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)",
-            [idx, name, now, now],
+            "INSERT INTO notebooks (id, name, created_at, updated_at, created_by, closed) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [idx, name, now, now, DEFAULT_USER_LOGIN, False],
         )
         notebook_ids[name] = idx
+        con.execute(
+            "INSERT OR IGNORE INTO notebook_owners (notebook_id, user_login) VALUES (?, ?)",
+            [idx, DEFAULT_USER_LOGIN],
+        )
 
     sections = [
         ("Идеи", notebook_ids["Личное"]),
@@ -80,9 +142,9 @@ def init_db(con: duckdb.DuckDBPyConnection) -> None:
     section_ids: dict[str, int] = {}
     for idx, (name, nb_id) in enumerate(sections, start=1):
         con.execute(
-            "INSERT INTO sections (id, notebook_id, name, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            [idx, nb_id, name, now, now],
+            "INSERT INTO sections (id, notebook_id, name, created_at, updated_at, created_by) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            [idx, nb_id, name, now, now, DEFAULT_USER_LOGIN],
         )
         section_ids[name] = idx
 
@@ -111,22 +173,82 @@ def init_db(con: duckdb.DuckDBPyConnection) -> None:
 
     for idx, (section_id, title, html) in enumerate(pages, start=1):
         con.execute(
-            "INSERT INTO pages (id, section_id, title, body_html, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            [idx, section_id, title, html, now, now],
+            "INSERT INTO pages (id, section_id, title, body_html, created_at, updated_at, created_by) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [idx, section_id, title, html, now, now, DEFAULT_USER_LOGIN],
         )
 
     con.commit()
 
 
-def get_notebooks(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
+def list_users(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
     return con.execute(
-        "SELECT id, name, created_at, updated_at FROM notebooks ORDER BY name"
+        "SELECT login, full_name FROM users ORDER BY full_name"
+    ).df()
+
+
+def create_user(con: duckdb.DuckDBPyConnection, login: str, full_name: str) -> str:
+    normalized = login.strip().lower()
+    if not normalized:
+        raise ValueError("Логин не может быть пустым")
+    name = full_name.strip() or normalized
+    con.execute(
+        "INSERT OR IGNORE INTO users (login, full_name) VALUES (?, ?)",
+        [normalized, name],
+    )
+    con.commit()
+    return normalized
+
+
+def add_notebook_owner(con: duckdb.DuckDBPyConnection, notebook_id: int, user_login: str) -> None:
+    con.execute(
+        "INSERT OR IGNORE INTO notebook_owners (notebook_id, user_login) VALUES (?, ?)",
+        [notebook_id, user_login],
+    )
+    con.commit()
+
+
+def set_notebook_closed(con: duckdb.DuckDBPyConnection, notebook_id: int, closed: bool) -> None:
+    con.execute("UPDATE notebooks SET closed = ?, updated_at = ? WHERE id = ?", [closed, datetime.now(), notebook_id])
+    con.commit()
+
+
+def is_notebook_owner(con: duckdb.DuckDBPyConnection, notebook_id: int, user_login: str) -> bool:
+    row = con.execute(
+        "SELECT 1 FROM notebook_owners WHERE notebook_id = ? AND user_login = ? LIMIT 1",
+        [notebook_id, user_login],
+    ).fetchone()
+    return bool(row)
+
+
+def get_notebook_owners(con: duckdb.DuckDBPyConnection, notebook_id: int) -> pd.DataFrame:
+    return con.execute(
+        """
+        SELECT o.user_login AS login, u.full_name
+        FROM notebook_owners o
+        LEFT JOIN users u ON u.login = o.user_login
+        WHERE o.notebook_id = ?
+        ORDER BY COALESCE(u.full_name, o.user_login)
+        """,
+        [notebook_id],
+    ).df()
+
+
+def get_notebooks(con: duckdb.DuckDBPyConnection, user_login: str) -> pd.DataFrame:
+    return con.execute(
+        """
+        SELECT id, name, created_at, updated_at, created_by, closed
+        FROM notebooks
+        WHERE closed = FALSE
+           OR id IN (SELECT notebook_id FROM notebook_owners WHERE user_login = ?)
+        ORDER BY name
+        """,
+        [user_login],
     ).df()
 
 
 def get_sections(con: duckdb.DuckDBPyConnection, notebook_id: int | None) -> pd.DataFrame:
-    query = "SELECT id, notebook_id, name, created_at, updated_at FROM sections"
+    query = "SELECT id, notebook_id, name, created_at, updated_at, created_by FROM sections"
     params: list[int] = []
     if notebook_id:
         query += " WHERE notebook_id = ?"
@@ -147,10 +269,12 @@ def load_pages_df(
             p.body_html,
             p.created_at,
             p.updated_at,
+            p.created_by,
             s.id AS section_id,
             s.name AS section_name,
             n.id AS notebook_id,
-            n.name AS notebook_name
+            n.name AS notebook_name,
+            n.closed AS notebook_closed
         FROM pages p
         JOIN sections s ON p.section_id = s.id
         JOIN notebooks n ON s.notebook_id = n.id
@@ -168,7 +292,7 @@ def load_pages_df(
     return con.execute(query, params).df()
 
 
-def create_notebook(con: duckdb.DuckDBPyConnection, name: str) -> int:
+def create_notebook(con: duckdb.DuckDBPyConnection, name: str, user_login: str) -> int:
     cleaned = name.strip() or "Новая записная книжка"
     now = datetime.now()
     notebook_id = (
@@ -177,14 +301,15 @@ def create_notebook(con: duckdb.DuckDBPyConnection, name: str) -> int:
         ).fetchone()[0]
     )
     con.execute(
-        "INSERT INTO notebooks (id, name, created_at, updated_at) VALUES (?, ?, ?, ?)",
-        [notebook_id, cleaned, now, now],
+        "INSERT INTO notebooks (id, name, created_at, updated_at, created_by, closed) VALUES (?, ?, ?, ?, ?, ?)",
+        [notebook_id, cleaned, now, now, user_login, False],
     )
+    add_notebook_owner(con, notebook_id, user_login)
     con.commit()
     return notebook_id
 
 
-def create_section(con: duckdb.DuckDBPyConnection, notebook_id: int, name: str) -> int:
+def create_section(con: duckdb.DuckDBPyConnection, notebook_id: int, name: str, user_login: str) -> int:
     cleaned = name.strip() or "Новый раздел"
     now = datetime.now()
     section_id = (
@@ -193,15 +318,15 @@ def create_section(con: duckdb.DuckDBPyConnection, notebook_id: int, name: str) 
         ).fetchone()[0]
     )
     con.execute(
-        "INSERT INTO sections (id, notebook_id, name, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?)",
-        [section_id, notebook_id, cleaned, now, now],
+        "INSERT INTO sections (id, notebook_id, name, created_at, updated_at, created_by) "
+        "VALUES (?, ?, ?, ?, ?, ?)",
+        [section_id, notebook_id, cleaned, now, now, user_login],
     )
     con.commit()
     return section_id
 
 
-def create_page(con: duckdb.DuckDBPyConnection, section_id: int) -> int:
+def create_page(con: duckdb.DuckDBPyConnection, section_id: int, user_login: str) -> int:
     now = datetime.now()
     page_id = (
         con.execute(
@@ -209,16 +334,16 @@ def create_page(con: duckdb.DuckDBPyConnection, section_id: int) -> int:
         ).fetchone()[0]
     )
     con.execute(
-        "INSERT INTO pages (id, section_id, title, body_html, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        [page_id, section_id, "Новая страница", "", now, now],
+        "INSERT INTO pages (id, section_id, title, body_html, created_at, updated_at, created_by) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [page_id, section_id, "Новая страница", "", now, now, user_login],
     )
     con.commit()
     return page_id
 
 
 def insert_page_with_content(
-    con: duckdb.DuckDBPyConnection, section_id: int, title: str, body_html: str
+    con: duckdb.DuckDBPyConnection, section_id: int, title: str, body_html: str, user_login: str
 ) -> int:
     """Insert a page with provided content into a section."""
     now = datetime.now()
@@ -228,9 +353,9 @@ def insert_page_with_content(
         ).fetchone()[0]
     )
     con.execute(
-        "INSERT INTO pages (id, section_id, title, body_html, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        [page_id, section_id, title.strip() or "Untitled", body_html, now, now],
+        "INSERT INTO pages (id, section_id, title, body_html, created_at, updated_at, created_by) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [page_id, section_id, title.strip() or "Untitled", body_html, now, now, user_login],
     )
     con.commit()
     return page_id
@@ -357,27 +482,103 @@ def main():
 
     con = get_connection()
 
-    notebooks_df = get_notebooks(con)
+    users_df = list_users(con)
+    user_records = list(users_df.itertuples(index=False))
+    user_map = {row.login: row.full_name for row in user_records}
+    login_options = [row.login for row in user_records]
 
+    stored_login = st.session_state.get("current_user_login")
+    if stored_login and stored_login not in login_options:
+        stored_login = None
+
+    with st.sidebar.expander("Пользователь", expanded=True):
+        selected_login: str | None = None
+        if login_options:
+            default_idx = login_options.index(stored_login) if stored_login in login_options else 0
+            selected_login = st.selectbox(
+                "Текущий пользователь",
+                options=login_options,
+                index=default_idx,
+                format_func=lambda login: f"{user_map.get(login, login)} ({login})",
+                key="current_user_selector",
+            )
+            st.session_state["current_user_login"] = selected_login
+        else:
+            st.info("Добавьте первого пользователя ниже.")
+
+    with st.sidebar.expander("? Новый пользователь", expanded=not login_options):
+        new_login = st.text_input("Логин", key="new_user_login")
+        new_full_name = st.text_input("Полное имя", key="new_user_full_name")
+        if st.button("Создать пользователя", key="create_user_btn"):
+            try:
+                created_login = create_user(con, new_login, new_full_name)
+                st.session_state["current_user_login"] = created_login
+                st.success("Пользователь создан")
+                st.rerun()
+            except ValueError as exc:
+                st.warning(str(exc))
+
+    if not selected_login:
+        st.warning("Выберите или создайте пользователя для работы с записными книжками.")
+        return
+
+    notebooks_df = get_notebooks(con, selected_login)
     selected_notebook_id: int | None = None
     selected_section_id: int | None = None
+    selected_notebook_row: pd.Series | None = None
 
     notebook_records = list(notebooks_df.itertuples(index=False))
     if notebook_records:
         selected_notebook = st.sidebar.selectbox(
-            "Записная книжка",
+            "Выберите книжку",
             notebook_records,
-            format_func=lambda row: row.name,
+            format_func=lambda row: f"{row.name}{' (закрыта)' if row.closed else ''}",
         )
         selected_notebook_id = int(selected_notebook.id)
+        selected_notebook_row = notebooks_df[notebooks_df["id"] == selected_notebook_id].iloc[0]
     else:
-        st.sidebar.info("Создайте первую записную книжку ниже.")
+        st.sidebar.info("Пока записных книжек нет.")
 
-    with st.sidebar.expander("➕ Новая книжка", expanded=False):
+    with st.sidebar.expander("? Новая книжка", expanded=False):
         new_nb_name = st.text_input("Название", key="new_notebook_name")
         if st.button("Создать записную книжку", key="create_notebook_btn"):
-            create_notebook(con, new_nb_name)
+            create_notebook(con, new_nb_name, selected_login)
             st.rerun()
+
+    can_edit_notebook = False
+    owners_df = pd.DataFrame()
+    if selected_notebook_id is not None:
+        can_edit_notebook = is_notebook_owner(con, selected_notebook_id, selected_login)
+        owners_df = get_notebook_owners(con, selected_notebook_id)
+        owners_text = ", ".join(
+            f"{row.full_name or row.login} ({row.login})" for row in owners_df.itertuples(index=False)
+        ) or "нет владельцев"
+        st.sidebar.caption(f"Владельцы: {owners_text}")
+        st.sidebar.caption(f"Статус: {'закрыта' if selected_notebook_row.closed else 'открыта'}")
+
+        if can_edit_notebook:
+            owner_logins = set(owners_df["login"].tolist())
+            with st.sidebar.expander("Права доступа", expanded=False):
+                with st.form(f"access_form_{selected_notebook_id}"):
+                    closed_value = st.checkbox(
+                        "Закрытая",
+                        value=bool(selected_notebook_row.closed),
+                        key=f"closed_flag_{selected_notebook_id}",
+                    )
+                    selectable_users = [login for login in login_options if login not in owner_logins]
+                    new_owner_login = st.selectbox(
+                        "Добавить владельца",
+                        options=[""] + selectable_users,
+                        format_func=lambda login: "—" if login == "" else f"{user_map.get(login, login)} ({login})",
+                        key=f"add_owner_{selected_notebook_id}",
+                    )
+                    submitted = st.form_submit_button("Сохранить настройки")
+                    if submitted:
+                        set_notebook_closed(con, selected_notebook_id, closed_value)
+                        if new_owner_login:
+                            add_notebook_owner(con, selected_notebook_id, new_owner_login)
+                        st.success("Права обновлены")
+                        st.rerun()
 
     sections_df = pd.DataFrame()
     if selected_notebook_id:
@@ -391,20 +592,25 @@ def main():
             )
             selected_section_id = int(selected_section.id)
         else:
-            st.sidebar.warning("В книжке пока нет разделов.")
+            st.sidebar.warning("В книжке нет разделов.")
 
-        with st.sidebar.expander("➕ Новый раздел", expanded=False):
-            new_section_name = st.text_input("Название раздела", key="new_section_name")
-            if st.button("Создать раздел", key="create_section_btn"):
-                create_section(con, selected_notebook_id, new_section_name)
-                st.rerun()
+        if can_edit_notebook:
+            with st.sidebar.expander("? Новый раздел", expanded=False):
+                new_section_name = st.text_input("Название раздела", key="new_section_name")
+                if st.button("Создать раздел", key="create_section_btn"):
+                    create_section(con, selected_notebook_id, new_section_name, selected_login)
+                    st.rerun()
+        else:
+            st.sidebar.info("Нет прав на создание разделов в этой книжке.")
 
         with st.sidebar.expander("Import .mht pages", expanded=False):
             if not selected_section_id:
-                st.info("Сначала выберите раздел.")
+                st.info("Выберите раздел для импорта.")
+            elif not can_edit_notebook:
+                st.info("Импорт доступен только владельцам книжки.")
             else:
                 uploaded = st.file_uploader(
-                    "Выберите .mht файлы", type=["mht"], accept_multiple_files=True, key="mht_files"
+                    "Загрузите .mht файлы", type=["mht"], accept_multiple_files=True, key="mht_files"
                 )
                 if uploaded and st.button("Импортировать .mht", key="import_mht_btn"):
                     imported = 0
@@ -412,7 +618,7 @@ def main():
                     for file in uploaded:
                         try:
                             title, body_html = parse_mht_to_html(file.getvalue(), file.name)
-                            insert_page_with_content(con, selected_section_id, title, body_html)
+                            insert_page_with_content(con, selected_section_id, title, body_html, selected_login)
                             imported += 1
                         except Exception as exc:
                             errors.append(f"{file.name}: {exc}")
@@ -424,10 +630,12 @@ def main():
 
     pages_df = load_pages_df(con, selected_notebook_id, selected_section_id)
 
-    if selected_section_id and st.sidebar.button("➕ Новая страница"):
-        new_page_id = create_page(con, selected_section_id)
-        st.sidebar.success(f"Создана страница ID = {new_page_id}")
+    if selected_section_id and can_edit_notebook and st.sidebar.button("? Новая страница"):
+        new_page_id = create_page(con, selected_section_id, selected_login)
+        st.sidebar.success(f"Новая страница ID = {new_page_id}")
         st.rerun()
+    elif selected_section_id and not can_edit_notebook:
+        st.sidebar.info("Нет прав на создание страниц в этой книжке.")
 
     df_display = pages_df[["id", "title"]].copy()
     gb = GridOptionsBuilder.from_dataframe(df_display)
@@ -450,39 +658,37 @@ def main():
         selected_rows = selected_rows.to_dict("records")
 
     if selected_rows:
-            row = selected_rows[0]
-            page_id = int(row["id"])
-            current_page = pages_df[pages_df["id"] == page_id].iloc[0]
-            current_title = current_page.get("title", "")
-            current_html = current_page.get("body_html") or ""
-            created_at = current_page.get("created_at")
-            updated_at = current_page.get("updated_at")
+        row = selected_rows[0]
+        page_id = int(row["id"])
+        current_page = pages_df[pages_df["id"] == page_id].iloc[0]
+        current_title = current_page.get("title", "")
+        current_html = current_page.get("body_html") or ""
+        st.caption(
+            f"{current_page['notebook_name']} • {current_page['section_name']} • {current_page['title']}"
+        )
 
-            st.caption(
-                f"{current_page['notebook_name']} › {current_page['section_name']} › {current_page['title']}"
-            )
+        preview_html = f"""
+        <style>
+        .preview-body *,
+        .preview-body p,
+        .preview-body li {{
+            line-height: 1.15 !important;
+        }}
+        .preview-body p {{
+            margin: 0.2em 0 !important;
+        }}
+        </style>
+        <div class="preview-body">
+            {current_html or "<p><em>Нет содержимого</em></p>"}
+        </div>
+        """
+        components.html(
+            preview_html,
+            height=520,
+            scrolling=True,
+        )
 
-            preview_html = f"""
-            <style>
-            .preview-body *,
-            .preview-body p,
-            .preview-body li {{
-                line-height: 1.15 !important;
-            }}
-            .preview-body p {{
-                margin: 0.2em 0 !important;
-            }}
-            </style>
-            <div class="preview-body">
-                {current_html or "<p><em>Нет содержимого</em></p>"}
-            </div>
-            """
-            components.html(
-                preview_html,
-                height=520,
-                scrolling=True,
-            )
-
+        if can_edit_notebook:
             edit_mode = st.checkbox(
                 "Редактировать страницу",
                 value=False,
@@ -500,29 +706,32 @@ def main():
                 quill_html = st_quill(
                     value=editable_html,
                     html=True,
-                    placeholder="Начните писать...",
+                    placeholder="Введите текст...",
                     key=f"quill_{page_id}",
                 ) or ""
 
                 confirm_delete = st.checkbox(
-                    "Подтверждаю удаление",
+                    "Подтвердить удаление",
                     key=f"confirm_delete_{page_id}",
                 )
                 cols = st.columns([2, 1])
-                if cols[0].button("💾 Сохранить изменения", key=f"save_{page_id}"):
+                if cols[0].button("?? Сохранить изменения", key=f"save_{page_id}"):
                     update_page(con, page_id, new_title, quill_html)
-                    st.success("Страница сохранена")
+                    st.success("Страница обновлена")
                     st.rerun()
-                if cols[1].button("🗑 Удалить страницу", key=f"delete_{page_id}", type="secondary"):
+                if cols[1].button("?? Удалить страницу", key=f"delete_{page_id}", type="secondary"):
                     if confirm_delete:
                         delete_page(con, page_id)
                         st.success("Страница удалена")
                         st.rerun()
                     else:
                         st.warning("Поставьте галочку для подтверждения.")
+        else:
+            st.info("У вас права только на просмотр этой записной книжки.")
     else:
-        st.info("Выберите страницу на боковой панели, чтобы просмотреть и отредактировать её.")
+        st.info("Выберите страницу слева, чтобы просмотреть и редактировать её.")
 
 
 if __name__ == "__main__":
     main()
+

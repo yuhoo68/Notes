@@ -10,6 +10,8 @@ from bs4 import BeautifulSoup
 # DB path and target section id
 DB_PATH = "onenote.duckdb"
 SECTION_ID = 1  # set your target section id
+IMPORT_USER_LOGIN = "importer"
+IMPORT_USER_NAME = "Import script"
 
 
 def html_to_body(text: str, fallback_title: str):
@@ -103,6 +105,19 @@ def load_html_file(path: pathlib.Path):
 def main():
     con = duckdb.connect(DB_PATH)
 
+    con.execute(
+        "INSERT OR IGNORE INTO users (login, full_name) VALUES (?, ?)",
+        [IMPORT_USER_LOGIN, IMPORT_USER_NAME],
+    )
+    notebook_row = con.execute(
+        "SELECT notebook_id FROM sections WHERE id = ?", [SECTION_ID]
+    ).fetchone()
+    if notebook_row:
+        con.execute(
+            "INSERT OR IGNORE INTO notebook_owners (notebook_id, user_login) VALUES (?, ?)",
+            [notebook_row[0], IMPORT_USER_LOGIN],
+        )
+
     files = list(glob.glob(r"exported_pages/*.mht")) + list(glob.glob(r"exported_pages/*.html"))
     for file in files:
         p = pathlib.Path(file)
@@ -113,10 +128,10 @@ def main():
 
         con.execute(
             """
-            INSERT INTO pages (id, section_id, title, body_html)
-            VALUES ((SELECT coalesce(max(id),0)+1 FROM pages), ?, ?, ?)
+            INSERT INTO pages (id, section_id, title, body_html, created_by, created_at, updated_at)
+            VALUES ((SELECT coalesce(max(id),0)+1 FROM pages), ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
             """,
-            [SECTION_ID, title, body],
+            [SECTION_ID, title, body, IMPORT_USER_LOGIN],
         )
 
     con.close()
