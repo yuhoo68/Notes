@@ -2,270 +2,197 @@ import base64
 import email
 import os
 import urllib.parse
-import streamlit.components.v1 as components
 from datetime import datetime
 
-import duckdb
+import streamlit.components.v1 as components
 import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup
 from st_aggrid import AgGrid, GridOptionsBuilder
 from streamlit_quill import st_quill
 
-DB_PATH = "onenote.duckdb"
-DEFAULT_USER_LOGIN = "owner"
-DEFAULT_USER_NAME = "Owner"
+import config
+from src.database_utils_DRP import get_execute, get_fetch, test_connection
+
+SCHEMA = "sbx_dfip_ocpp"
+USERS_TABLE = f"{SCHEMA}.notes_users"
+NOTEBOOKS_TABLE = f"{SCHEMA}.notes_notebooks"
+SECTIONS_TABLE = f"{SCHEMA}.notes_sections"
+PAGES_TABLE = f"{SCHEMA}.notes_pages"
+OWNERS_TABLE = f"{SCHEMA}.notes_notebook_owners"
 
 
-@st.cache_resource
-def get_connection():
-    con = duckdb.connect(DB_PATH)
-    init_db(con)
-    return con
+def _escape(val: str) -> str:
+    """Minimal escaping for SQL string literals."""
+    return (val or "").replace("'", "''")
 
 
-def init_db(con: duckdb.DuckDBPyConnection) -> None:
-    """Create the OneNote-like schema, apply simple migrations, and seed demo data."""
-    con.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            login TEXT PRIMARY KEY,
-            full_name TEXT NOT NULL
-        )
+def ensure_db_credentials() -> dict[str, str]:
+    """Request DB creds once per session via modal dialog."""
+    creds = st.session_state.get("db_credentials")
+    if creds and creds.get("user") and creds.get("password"):
+        st.session_state.setdefault("current_user_login", creds["user"])
+        return creds
+
+    @st.dialog("Подключение к базе", width="small")
+    def _ask_credentials():
+        st.write("Введите логин и пароль PostgreSQL.")
+        with st.form("db_login_form", clear_on_submit=False):
+            user = st.text_input("Логин", key="db_login")
+            pwd = st.text_input("Пароль", type="password", key="db_password")
+            submitted = st.form_submit_button("Подключиться")
+            if submitted:
+                if not user or not pwd:
+                    st.error("Укажите логин и пароль.")
+                    return
+                if not test_connection(user, pwd):
+                    st.error("Не удалось подключиться. Проверьте данные.")
+                    return
+                st.session_state["db_credentials"] = {"user": user, "password": pwd}
+                st.session_state["current_user_login"] = user
+                st.success("Подключение установлено. Обновляем страницу...")
+                st.rerun()
+
+    _ask_credentials()
+    st.stop()
+
+
+def _creds() -> tuple[str, str]:
+    creds = ensure_db_credentials()
+    return creds["user"], creds["password"]
+
+
+def run_fetch_df(query: str) -> pd.DataFrame:
+    user, pwd = _creds()
+    result = get_fetch(query, user, pwd)
+    if not result:
+        return pd.DataFrame()
+    rows, columns = result
+    return pd.DataFrame(rows, columns=columns)
+
+
+def run_execute(query: str) -> int | None:
+    user, pwd = _creds()
+    return get_execute(query, user, pwd)
+
+
+def run_scalar(query: str):
+    df = run_fetch_df(query)
+    if df.empty:
+        return None
+    return df.iat[0, 0]
+
+
+def list_users() -> pd.DataFrame:
+    return run_fetch_df(
+        f"""
+        SELECT login, full_name
+        FROM {USERS_TABLE}
+        ORDER BY COALESCE(full_name, login)
         """
     )
-    con.execute(
-        """
-        CREATE TABLE IF NOT EXISTS notebooks (
-            id INTEGER PRIMARY KEY,
-            name TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            created_by TEXT REFERENCES users(login),
-            closed BOOLEAN DEFAULT FALSE
-        )
-        """
-    )
-    con.execute(
-        """
-        CREATE TABLE IF NOT EXISTS sections (
-            id INTEGER PRIMARY KEY,
-            notebook_id INTEGER NOT NULL,
-            name TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            created_by TEXT REFERENCES users(login)
-        )
-        """
-    )
-    con.execute(
-        """
-        CREATE TABLE IF NOT EXISTS pages (
-            id INTEGER PRIMARY KEY,
-            section_id INTEGER NOT NULL,
-            title TEXT NOT NULL,
-            body_html TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            created_by TEXT REFERENCES users(login)
-        )
-        """
-    )
-    con.execute(
-        """
-        CREATE TABLE IF NOT EXISTS notebook_owners (
-            notebook_id INTEGER NOT NULL,
-            user_login TEXT NOT NULL,
-            PRIMARY KEY (notebook_id, user_login),
-            FOREIGN KEY (notebook_id) REFERENCES notebooks(id),
-            FOREIGN KEY (user_login) REFERENCES users(login)
-        )
-        """
-    )
-
-    # Lightweight migrations for existing databases.
-    con.execute("ALTER TABLE notebooks ADD COLUMN IF NOT EXISTS closed BOOLEAN DEFAULT FALSE")
-    con.execute("ALTER TABLE notebooks ADD COLUMN IF NOT EXISTS created_by TEXT")
-    con.execute("ALTER TABLE sections ADD COLUMN IF NOT EXISTS created_by TEXT")
-    con.execute("ALTER TABLE pages ADD COLUMN IF NOT EXISTS created_by TEXT")
-
-    con.execute(
-        "INSERT OR IGNORE INTO users (login, full_name) VALUES (?, ?)",
-        [DEFAULT_USER_LOGIN, DEFAULT_USER_NAME],
-    )
-    con.execute(
-        "UPDATE notebooks SET created_by = ? WHERE created_by IS NULL",
-        [DEFAULT_USER_LOGIN],
-    )
-    con.execute("UPDATE notebooks SET closed = FALSE WHERE closed IS NULL")
-    con.execute(
-        "UPDATE sections SET created_by = ? WHERE created_by IS NULL",
-        [DEFAULT_USER_LOGIN],
-    )
-    con.execute(
-        "UPDATE pages SET created_by = ? WHERE created_by IS NULL",
-        [DEFAULT_USER_LOGIN],
-    )
-    con.execute(
-        """
-        INSERT OR IGNORE INTO notebook_owners (notebook_id, user_login)
-        SELECT id, COALESCE(created_by, ?) FROM notebooks
-        """,
-        [DEFAULT_USER_LOGIN],
-    )
-
-    if con.execute("SELECT COUNT(*) FROM notebooks").fetchone()[0] > 0:
-        con.commit()
-        return
-
-    now = datetime.now()
-    notebooks = ["Личное", "Работа"]
-    notebook_ids: dict[str, int] = {}
-    for idx, name in enumerate(notebooks, start=1):
-        con.execute(
-            "INSERT INTO notebooks (id, name, created_at, updated_at, created_by, closed) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            [idx, name, now, now, DEFAULT_USER_LOGIN, False],
-        )
-        notebook_ids[name] = idx
-        con.execute(
-            "INSERT OR IGNORE INTO notebook_owners (notebook_id, user_login) VALUES (?, ?)",
-            [idx, DEFAULT_USER_LOGIN],
-        )
-
-    sections = [
-        ("Идеи", notebook_ids["Личное"]),
-        ("Путешествия", notebook_ids["Личное"]),
-        ("Проекты", notebook_ids["Работа"]),
-        ("Встречи", notebook_ids["Работа"]),
-    ]
-    section_ids: dict[str, int] = {}
-    for idx, (name, nb_id) in enumerate(sections, start=1):
-        con.execute(
-            "INSERT INTO sections (id, notebook_id, name, created_at, updated_at, created_by) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            [idx, nb_id, name, now, now, DEFAULT_USER_LOGIN],
-        )
-        section_ids[name] = idx
-
-    pages = [
-        (
-            section_ids["Идеи"],
-            "Планы на отпуск",
-            "<h2>Планы на отпуск</h2><p>Подборка мест и активности для июля.</p>",
-        ),
-        (
-            section_ids["Путешествия"],
-            "Прага",
-            "<p><strong>Маршрут</strong>: Старый город → Карлов мост → Пражский град.</p>",
-        ),
-        (
-            section_ids["Проекты"],
-            "Dashboard v2",
-            "<h3>Задачи</h3><ul><li>Подключить DuckDB</li><li>Перенести UI на Streamlit</li></ul>",
-        ),
-        (
-            section_ids["Встречи"],
-            "Команда маркетинга",
-            "<p>Пункты обсуждения:<ol><li>Запуск рекламной кампании</li><li>Новые метрики</li></ol></p>",
-        ),
-    ]
-
-    for idx, (section_id, title, html) in enumerate(pages, start=1):
-        con.execute(
-            "INSERT INTO pages (id, section_id, title, body_html, created_at, updated_at, created_by) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            [idx, section_id, title, html, now, now, DEFAULT_USER_LOGIN],
-        )
-
-    con.commit()
 
 
-def list_users(con: duckdb.DuckDBPyConnection) -> pd.DataFrame:
-    return con.execute(
-        "SELECT login, full_name FROM users ORDER BY full_name"
-    ).df()
-
-
-def create_user(con: duckdb.DuckDBPyConnection, login: str, full_name: str) -> str:
+def create_user(login: str, full_name: str) -> str:
     normalized = login.strip().lower()
     if not normalized:
         raise ValueError("Логин не может быть пустым")
     name = full_name.strip() or normalized
-    con.execute(
-        "INSERT OR IGNORE INTO users (login, full_name) VALUES (?, ?)",
-        [normalized, name],
+    run_execute(
+        f"""
+        INSERT INTO {USERS_TABLE} (login, full_name)
+        VALUES ('{_escape(normalized)}', '{_escape(name)}')
+        ON CONFLICT (login) DO NOTHING
+        """
     )
-    con.commit()
     return normalized
 
 
-def add_notebook_owner(con: duckdb.DuckDBPyConnection, notebook_id: int, user_login: str) -> None:
-    con.execute(
-        "INSERT OR IGNORE INTO notebook_owners (notebook_id, user_login) VALUES (?, ?)",
-        [notebook_id, user_login],
+def add_notebook_owner(notebook_id: int, user_login: str) -> None:
+    run_execute(
+        f"""
+        INSERT INTO {OWNERS_TABLE} (notebook_id, user_login)
+        VALUES ({int(notebook_id)}, '{_escape(user_login)}')
+        ON CONFLICT DO NOTHING
+        """
     )
-    con.commit()
 
 
-def set_notebook_closed(con: duckdb.DuckDBPyConnection, notebook_id: int, closed: bool) -> None:
-    con.execute("UPDATE notebooks SET closed = ?, updated_at = ? WHERE id = ?", [closed, datetime.now(), notebook_id])
-    con.commit()
-
-
-def is_notebook_owner(con: duckdb.DuckDBPyConnection, notebook_id: int, user_login: str) -> bool:
-    row = con.execute(
-        "SELECT 1 FROM notebook_owners WHERE notebook_id = ? AND user_login = ? LIMIT 1",
-        [notebook_id, user_login],
-    ).fetchone()
-    return bool(row)
-
-
-def get_notebook_owners(con: duckdb.DuckDBPyConnection, notebook_id: int) -> pd.DataFrame:
-    return con.execute(
+def set_notebook_closed(notebook_id: int, closed: bool) -> None:
+    run_execute(
+        f"""
+        UPDATE {NOTEBOOKS_TABLE}
+        SET closed = {'TRUE' if closed else 'FALSE'}, updated_at = NOW()
+        WHERE id = {int(notebook_id)}
         """
+    )
+
+
+def is_notebook_owner(notebook_id: int, user_login: str) -> bool:
+    result = run_scalar(
+        f"""
+        SELECT 1
+        FROM {OWNERS_TABLE}
+        WHERE notebook_id = {int(notebook_id)} AND user_login = '{_escape(user_login)}'
+        LIMIT 1
+        """
+    )
+    return bool(result)
+
+
+def get_notebook_owners(notebook_id: int) -> pd.DataFrame:
+    return run_fetch_df(
+        f"""
         SELECT o.user_login AS login, u.full_name
-        FROM notebook_owners o
-        LEFT JOIN users u ON u.login = o.user_login
-        WHERE o.notebook_id = ?
+        FROM {OWNERS_TABLE} o
+        LEFT JOIN {USERS_TABLE} u ON u.login = o.user_login
+        WHERE o.notebook_id = {int(notebook_id)}
         ORDER BY COALESCE(u.full_name, o.user_login)
-        """,
-        [notebook_id],
-    ).df()
-
-
-def get_notebooks(con: duckdb.DuckDBPyConnection, user_login: str) -> pd.DataFrame:
-    return con.execute(
         """
+    )
+
+
+def get_notebooks(user_login: str) -> pd.DataFrame:
+    return run_fetch_df(
+        f"""
         SELECT id, name, created_at, updated_at, created_by, closed
-        FROM notebooks
+        FROM {NOTEBOOKS_TABLE}
         WHERE closed = FALSE
-           OR id IN (SELECT notebook_id FROM notebook_owners WHERE user_login = ?)
+           OR id IN (
+                SELECT notebook_id
+                FROM {OWNERS_TABLE}
+                WHERE user_login = '{_escape(user_login)}'
+           )
         ORDER BY name
-        """,
-        [user_login],
-    ).df()
+        """
+    )
 
 
-def get_sections(con: duckdb.DuckDBPyConnection, notebook_id: int | None) -> pd.DataFrame:
-    query = "SELECT id, notebook_id, name, created_at, updated_at, created_by FROM sections"
-    params: list[int] = []
+def get_sections(notebook_id: int | None) -> pd.DataFrame:
+    query = f"""
+        SELECT id, notebook_id, name, created_at, updated_at, created_by
+        FROM {SECTIONS_TABLE}
+    """
     if notebook_id:
-        query += " WHERE notebook_id = ?"
-        params.append(notebook_id)
+        query += f" WHERE notebook_id = {int(notebook_id)}"
     query += " ORDER BY name"
-    return con.execute(query, params).df()
+    return run_fetch_df(query)
 
 
 def load_pages_df(
-    con: duckdb.DuckDBPyConnection,
     notebook_id: int | None,
     section_id: int | None,
+    allowed_notebook_ids: list[int],
+    search_text: str | None,
+    search_tags_only: bool,
 ) -> pd.DataFrame:
-    query = """
+    if not allowed_notebook_ids:
+        return pd.DataFrame()
+    query = f"""
         SELECT
             p.id,
             p.title,
+            p.tag,
             p.body_html,
             p.created_at,
             p.updated_at,
@@ -275,108 +202,98 @@ def load_pages_df(
             n.id AS notebook_id,
             n.name AS notebook_name,
             n.closed AS notebook_closed
-        FROM pages p
-        JOIN sections s ON p.section_id = s.id
-        JOIN notebooks n ON s.notebook_id = n.id
+        FROM {PAGES_TABLE} p
+        JOIN {SECTIONS_TABLE} s ON p.section_id = s.id
+        JOIN {NOTEBOOKS_TABLE} n ON s.notebook_id = n.id
         WHERE 1=1
     """
-    params: list[int] = []
+    allowed_csv = ", ".join(str(int(x)) for x in allowed_notebook_ids)
+    query += f" AND n.id IN ({allowed_csv})"
     if notebook_id:
-        query += " AND n.id = ?"
-        params.append(notebook_id)
+        query += f" AND n.id = {int(notebook_id)}"
     if section_id:
-        query += " AND s.id = ?"
-        params.append(section_id)
+        query += f" AND s.id = {int(section_id)}"
+    if search_text:
+        if search_tags_only:
+            query += f" AND p.tag ILIKE '%{_escape(search_text)}%'"
+        else:
+            q = _escape(search_text)
+            query += f" AND (p.title ILIKE '%{q}%' OR p.body_html ILIKE '%{q}%')"
 
     query += " ORDER BY p.updated_at DESC, p.id DESC"
-    return con.execute(query, params).df()
+    return run_fetch_df(query)
 
 
-def create_notebook(con: duckdb.DuckDBPyConnection, name: str, user_login: str) -> int:
-    cleaned = name.strip() or "Новая записная книжка"
-    now = datetime.now()
-    notebook_id = (
-        con.execute(
-            "SELECT COALESCE(MAX(id), 0) + 1 FROM notebooks"
-        ).fetchone()[0]
+def create_notebook(name: str, user_login: str) -> int:
+    cleaned = name.strip() or "Новый блокнот"
+    new_id = run_scalar(
+        f"""
+        INSERT INTO {NOTEBOOKS_TABLE} (name, created_by, closed)
+        VALUES ('{_escape(cleaned)}', '{_escape(user_login)}', FALSE)
+        RETURNING id
+        """
     )
-    con.execute(
-        "INSERT INTO notebooks (id, name, created_at, updated_at, created_by, closed) VALUES (?, ?, ?, ?, ?, ?)",
-        [notebook_id, cleaned, now, now, user_login, False],
-    )
-    add_notebook_owner(con, notebook_id, user_login)
-    con.commit()
-    return notebook_id
+    if new_id is None:
+        raise RuntimeError("Не удалось создать блокнот")
+    add_notebook_owner(int(new_id), user_login)
+    return int(new_id)
 
 
-def create_section(con: duckdb.DuckDBPyConnection, notebook_id: int, name: str, user_login: str) -> int:
+def create_section(notebook_id: int, name: str, user_login: str) -> int:
     cleaned = name.strip() or "Новый раздел"
-    now = datetime.now()
-    section_id = (
-        con.execute(
-            "SELECT COALESCE(MAX(id), 0) + 1 FROM sections"
-        ).fetchone()[0]
+    new_id = run_scalar(
+        f"""
+        INSERT INTO {SECTIONS_TABLE} (notebook_id, name, created_by)
+        VALUES ({int(notebook_id)}, '{_escape(cleaned)}', '{_escape(user_login)}')
+        RETURNING id
+        """
     )
-    con.execute(
-        "INSERT INTO sections (id, notebook_id, name, created_at, updated_at, created_by) "
-        "VALUES (?, ?, ?, ?, ?, ?)",
-        [section_id, notebook_id, cleaned, now, now, user_login],
+    if new_id is None:
+        raise RuntimeError("Не удалось создать раздел")
+    return int(new_id)
+
+
+def create_page(section_id: int, user_login: str) -> int:
+    new_id = run_scalar(
+        f"""
+        INSERT INTO {PAGES_TABLE} (section_id, title, tag, body_html, created_by)
+        VALUES ({int(section_id)}, 'Новая страница', '', '', '{_escape(user_login)}')
+        RETURNING id
+        """
     )
-    con.commit()
-    return section_id
+    if new_id is None:
+        raise RuntimeError("Не удалось создать страницу")
+    return int(new_id)
 
 
-def create_page(con: duckdb.DuckDBPyConnection, section_id: int, user_login: str) -> int:
-    now = datetime.now()
-    page_id = (
-        con.execute(
-            "SELECT COALESCE(MAX(id), 0) + 1 FROM pages"
-        ).fetchone()[0]
+def insert_page_with_content(section_id: int, title: str, body_html: str, user_login: str) -> int:
+    new_id = run_scalar(
+        f"""
+        INSERT INTO {PAGES_TABLE} (section_id, title, tag, body_html, created_by)
+        VALUES ({int(section_id)}, '{_escape(title.strip() or 'Untitled')}', '', '{_escape(body_html)}', '{_escape(user_login)}')
+        RETURNING id
+        """
     )
-    con.execute(
-        "INSERT INTO pages (id, section_id, title, body_html, created_at, updated_at, created_by) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        [page_id, section_id, "Новая страница", "", now, now, user_login],
+    if new_id is None:
+        raise RuntimeError("Не удалось импортировать страницу")
+    return int(new_id)
+
+
+def update_page(page_id: int, title: str, body_html: str, tag: str) -> None:
+    run_execute(
+        f"""
+        UPDATE {PAGES_TABLE}
+        SET title = '{_escape(title.strip() or 'Без названия')}',
+            tag = '{_escape(tag)}',
+            body_html = '{_escape(body_html)}',
+            updated_at = NOW()
+        WHERE id = {int(page_id)}
+        """
     )
-    con.commit()
-    return page_id
 
 
-def insert_page_with_content(
-    con: duckdb.DuckDBPyConnection, section_id: int, title: str, body_html: str, user_login: str
-) -> int:
-    """Insert a page with provided content into a section."""
-    now = datetime.now()
-    page_id = (
-        con.execute(
-            "SELECT COALESCE(MAX(id), 0) + 1 FROM pages"
-        ).fetchone()[0]
-    )
-    con.execute(
-        "INSERT INTO pages (id, section_id, title, body_html, created_at, updated_at, created_by) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-        [page_id, section_id, title.strip() or "Untitled", body_html, now, now, user_login],
-    )
-    con.commit()
-    return page_id
-
-
-def update_page(
-    con: duckdb.DuckDBPyConnection, page_id: int, title: str, body_html: str
-) -> None:
-    now = datetime.now()
-    con.execute(
-        "UPDATE pages SET title = ?, body_html = ?, updated_at = ? WHERE id = ?",
-        [title.strip() or "Без названия", body_html, now, page_id],
-    )
-    con.commit()
-
-
-def delete_page(con: duckdb.DuckDBPyConnection, page_id: int) -> None:
-    con.execute("DELETE FROM pages WHERE id = ?", [page_id])
-    con.commit()
-
-
+def delete_page(page_id: int) -> None:
+    run_execute(f"DELETE FROM {PAGES_TABLE} WHERE id = {int(page_id)}")
 def html_to_body(text: str, fallback_title: str):
     """Extract title and body HTML from raw HTML text."""
     soup = BeautifulSoup(text, "html.parser")
@@ -404,7 +321,7 @@ def parse_mht_to_html(data: bytes, filename: str):
                 resources.append((ctype, payload, cid, loc))
 
     if not html_part:
-        raise ValueError(f"No HTML part found in {filename}")
+        raise ValueError("Логин не может быть пустым")
 
     def norm(val: str) -> str:
         val = urllib.parse.unquote(val or "").strip()
@@ -480,49 +397,35 @@ def main():
         page_title="OneNote",
     )
 
-    con = get_connection()
+    ensure_db_credentials()
 
-    users_df = list_users(con)
+    users_df = list_users()
     user_records = list(users_df.itertuples(index=False))
     user_map = {row.login: row.full_name for row in user_records}
     login_options = [row.login for row in user_records]
 
     stored_login = st.session_state.get("current_user_login")
+    db_user = st.session_state.get("db_credentials", {}).get("user")
     if stored_login and stored_login not in login_options:
         stored_login = None
+    if not stored_login and db_user in login_options:
+        stored_login = db_user
 
-    with st.sidebar.expander("Пользователь", expanded=True):
-        selected_login: str | None = None
-        if login_options:
-            default_idx = login_options.index(stored_login) if stored_login in login_options else 0
-            selected_login = st.selectbox(
-                "Текущий пользователь",
-                options=login_options,
-                index=default_idx,
-                format_func=lambda login: f"{user_map.get(login, login)} ({login})",
-                key="current_user_selector",
-            )
-            st.session_state["current_user_login"] = selected_login
-        else:
-            st.info("Добавьте первого пользователя ниже.")
+    search_raw = st.sidebar.text_input("Поиск страниц", key="page_search", placeholder="#tag или текст").strip()
+    search_tags_only = search_raw.startswith("#")
+    search_text = search_raw[1:].strip() if search_tags_only else search_raw
 
-    with st.sidebar.expander("? Новый пользователь", expanded=not login_options):
-        new_login = st.text_input("Логин", key="new_user_login")
-        new_full_name = st.text_input("Полное имя", key="new_user_full_name")
-        if st.button("Создать пользователя", key="create_user_btn"):
-            try:
-                created_login = create_user(con, new_login, new_full_name)
-                st.session_state["current_user_login"] = created_login
-                st.success("Пользователь создан")
-                st.rerun()
-            except ValueError as exc:
-                st.warning(str(exc))
-
-    if not selected_login:
-        st.warning("Выберите или создайте пользователя для работы с записными книжками.")
+    selected_login: str | None = None
+    if login_options:
+        selected_login = stored_login or login_options[0]
+        st.session_state["current_user_login"] = selected_login
+        st.sidebar.caption(f"User: {user_map.get(selected_login, selected_login)}")
+    else:
+        st.sidebar.info("No users available in the database.")
         return
 
-    notebooks_df = get_notebooks(con, selected_login)
+    notebooks_df = get_notebooks(selected_login)
+    allowed_notebook_ids = notebooks_df["id"].astype(int).tolist()
     selected_notebook_id: int | None = None
     selected_section_id: int | None = None
     selected_notebook_row: pd.Series | None = None
@@ -542,14 +445,14 @@ def main():
     with st.sidebar.expander("? Новая книжка", expanded=False):
         new_nb_name = st.text_input("Название", key="new_notebook_name")
         if st.button("Создать записную книжку", key="create_notebook_btn"):
-            create_notebook(con, new_nb_name, selected_login)
+            create_notebook(new_nb_name, selected_login)
             st.rerun()
 
     can_edit_notebook = False
     owners_df = pd.DataFrame()
     if selected_notebook_id is not None:
-        can_edit_notebook = is_notebook_owner(con, selected_notebook_id, selected_login)
-        owners_df = get_notebook_owners(con, selected_notebook_id)
+        can_edit_notebook = is_notebook_owner(selected_notebook_id, selected_login)
+        owners_df = get_notebook_owners(selected_notebook_id)
         owners_text = ", ".join(
             f"{row.full_name or row.login} ({row.login})" for row in owners_df.itertuples(index=False)
         ) or "нет владельцев"
@@ -574,15 +477,15 @@ def main():
                     )
                     submitted = st.form_submit_button("Сохранить настройки")
                     if submitted:
-                        set_notebook_closed(con, selected_notebook_id, closed_value)
+                        set_notebook_closed(selected_notebook_id, closed_value)
                         if new_owner_login:
-                            add_notebook_owner(con, selected_notebook_id, new_owner_login)
+                            add_notebook_owner(selected_notebook_id, new_owner_login)
                         st.success("Права обновлены")
                         st.rerun()
 
     sections_df = pd.DataFrame()
     if selected_notebook_id:
-        sections_df = get_sections(con, selected_notebook_id)
+        sections_df = get_sections(selected_notebook_id)
         section_records = list(sections_df.itertuples(index=False))
         if section_records:
             selected_section = st.sidebar.selectbox(
@@ -598,7 +501,7 @@ def main():
             with st.sidebar.expander("? Новый раздел", expanded=False):
                 new_section_name = st.text_input("Название раздела", key="new_section_name")
                 if st.button("Создать раздел", key="create_section_btn"):
-                    create_section(con, selected_notebook_id, new_section_name, selected_login)
+                    create_section(selected_notebook_id, new_section_name, selected_login)
                     st.rerun()
         else:
             st.sidebar.info("Нет прав на создание разделов в этой книжке.")
@@ -618,7 +521,7 @@ def main():
                     for file in uploaded:
                         try:
                             title, body_html = parse_mht_to_html(file.getvalue(), file.name)
-                            insert_page_with_content(con, selected_section_id, title, body_html, selected_login)
+                            insert_page_with_content(selected_section_id, title, body_html, selected_login)
                             imported += 1
                         except Exception as exc:
                             errors.append(f"{file.name}: {exc}")
@@ -628,10 +531,33 @@ def main():
                     if errors:
                         st.warning(";\n".join(errors))
 
-    pages_df = load_pages_df(con, selected_notebook_id, selected_section_id)
+    pages_df = load_pages_df(
+        selected_notebook_id,
+        selected_section_id,
+        allowed_notebook_ids,
+        search_text or None,
+        search_tags_only,
+    )
+    if pages_df.empty:
+        pages_df = pd.DataFrame(
+            columns=[
+                "id",
+                "title",
+                "tag",
+                "body_html",
+                "created_at",
+                "updated_at",
+                "created_by",
+                "section_id",
+                "section_name",
+                "notebook_id",
+                "notebook_name",
+                "notebook_closed",
+            ]
+        )
 
     if selected_section_id and can_edit_notebook and st.sidebar.button("? Новая страница"):
-        new_page_id = create_page(con, selected_section_id, selected_login)
+        new_page_id = create_page(selected_section_id, selected_login)
         st.sidebar.success(f"Новая страница ID = {new_page_id}")
         st.rerun()
     elif selected_section_id and not can_edit_notebook:
@@ -664,9 +590,10 @@ def main():
         current_title = current_page.get("title", "")
         current_html = current_page.get("body_html") or ""
         st.caption(
-            f"{current_page['notebook_name']} • {current_page['section_name']} • {current_page['title']}"
+            f"{current_page['notebook_name']} - {current_page['section_name']} - {current_page['title']}"
         )
-
+        if current_page.get("tag"):
+            st.caption(f"Tag: {current_page['tag']}")
         preview_html = f"""
         <style>
         .preview-body *,
@@ -702,6 +629,11 @@ def main():
                     value=current_title,
                     key=f"title_{page_id}",
                 )
+                new_tag = st.text_input(
+                    "Тег",
+                    value=current_page.get("tag") or "",
+                    key=f"tag_{page_id}",
+                )
                 editable_html = strip_data_uri_images(current_html)
                 quill_html = st_quill(
                     value=editable_html,
@@ -716,12 +648,12 @@ def main():
                 )
                 cols = st.columns([2, 1])
                 if cols[0].button("?? Сохранить изменения", key=f"save_{page_id}"):
-                    update_page(con, page_id, new_title, quill_html)
+                    update_page(page_id, new_title, quill_html, new_tag)
                     st.success("Страница обновлена")
                     st.rerun()
                 if cols[1].button("?? Удалить страницу", key=f"delete_{page_id}", type="secondary"):
                     if confirm_delete:
-                        delete_page(con, page_id)
+                        delete_page(page_id)
                         st.success("Страница удалена")
                         st.rerun()
                     else:
@@ -734,4 +666,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
