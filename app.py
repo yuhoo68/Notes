@@ -1,5 +1,6 @@
 import base64
 import email
+import logging
 import os
 import urllib.parse
 from datetime import datetime
@@ -21,14 +22,32 @@ SECTIONS_TABLE = f"{SCHEMA}.notes_sections"
 PAGES_TABLE = f"{SCHEMA}.notes_pages"
 OWNERS_TABLE = f"{SCHEMA}.notes_notebook_owners"
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("notes_app")
+
 
 def _escape(val: str) -> str:
-    """Minimal escaping for SQL string literals."""
+    """Минимальное экранирование строк для SQL."""
     return (val or "").replace("'", "''")
 
 
+def _name_patronymic(full_name: str | None, fallback_login: str) -> str:
+    """Возвращает Имя Отчество из full_name, иначе login."""
+    if not full_name:
+        return fallback_login
+    parts = full_name.strip().split()
+    if len(parts) >= 3:
+        return " ".join(parts[1:3])
+    if len(parts) >= 2:
+        return " ".join(parts[1:])
+    return full_name.strip() or fallback_login
+
+
 def ensure_db_credentials() -> dict[str, str]:
-    """Request DB creds once per session via modal dialog."""
+    """Запрос логина/пароля к БД один раз за сессию."""
     creds = st.session_state.get("db_credentials")
     if creds and creds.get("user") and creds.get("password"):
         st.session_state.setdefault("current_user_login", creds["user"])
@@ -98,6 +117,7 @@ def create_user(login: str, full_name: str) -> str:
     if not normalized:
         raise ValueError("Логин не может быть пустым")
     name = full_name.strip() or normalized
+    logger.info("Создание пользователя: login=%s, full_name=%s", normalized, name)
     run_execute(
         f"""
         INSERT INTO {USERS_TABLE} (login, full_name)
@@ -109,6 +129,7 @@ def create_user(login: str, full_name: str) -> str:
 
 
 def add_notebook_owner(notebook_id: int, user_login: str) -> None:
+    logger.info("Добавление владельца: notebook_id=%s user=%s", notebook_id, user_login)
     run_execute(
         f"""
         INSERT INTO {OWNERS_TABLE} (notebook_id, user_login)
@@ -119,6 +140,7 @@ def add_notebook_owner(notebook_id: int, user_login: str) -> None:
 
 
 def set_notebook_closed(notebook_id: int, closed: bool) -> None:
+    logger.info("Изменение статуса книги: id=%s closed=%s", notebook_id, closed)
     run_execute(
         f"""
         UPDATE {NOTEBOOKS_TABLE}
@@ -225,7 +247,8 @@ def load_pages_df(
 
 
 def create_notebook(name: str, user_login: str) -> int:
-    cleaned = name.strip() or "Новый блокнот"
+    cleaned = name.strip() or "Новая книга"
+    logger.info("Создание книги: %s пользователем %s", cleaned, user_login)
     new_id = run_scalar(
         f"""
         INSERT INTO {NOTEBOOKS_TABLE} (name, created_by, closed)
@@ -234,13 +257,14 @@ def create_notebook(name: str, user_login: str) -> int:
         """
     )
     if new_id is None:
-        raise RuntimeError("Не удалось создать блокнот")
+        raise RuntimeError("Не удалось создать книгу")
     add_notebook_owner(int(new_id), user_login)
     return int(new_id)
 
 
 def create_section(notebook_id: int, name: str, user_login: str) -> int:
     cleaned = name.strip() or "Новый раздел"
+    logger.info("Создание раздела: %s в книге %s пользователем %s", cleaned, notebook_id, user_login)
     new_id = run_scalar(
         f"""
         INSERT INTO {SECTIONS_TABLE} (notebook_id, name, created_by)
@@ -254,6 +278,7 @@ def create_section(notebook_id: int, name: str, user_login: str) -> int:
 
 
 def create_page(section_id: int, user_login: str) -> int:
+    logger.info("Создание страницы: section_id=%s user=%s", section_id, user_login)
     new_id = run_scalar(
         f"""
         INSERT INTO {PAGES_TABLE} (section_id, title, tag, body_html, created_by)
@@ -293,9 +318,12 @@ def update_page(page_id: int, title: str, body_html: str, tag: str) -> None:
 
 
 def delete_page(page_id: int) -> None:
+    logger.info("Удаление страницы: id=%s", page_id)
     run_execute(f"DELETE FROM {PAGES_TABLE} WHERE id = {int(page_id)}")
+
+
 def html_to_body(text: str, fallback_title: str):
-    """Extract title and body HTML from raw HTML text."""
+    """Извлекает title и body из HTML."""
     soup = BeautifulSoup(text, "html.parser")
     title = soup.title.string.strip() if soup.title and soup.title.string else fallback_title
     body = str(soup.body or soup)
@@ -303,7 +331,7 @@ def html_to_body(text: str, fallback_title: str):
 
 
 def parse_mht_to_html(data: bytes, filename: str):
-    """Parse .mht, inline referenced resources, return (title, body_html)."""
+    """Парсинг .mht, инлайн ресурсов, возврат (title, body_html)."""
     msg = email.message_from_bytes(data)
     html_part = None
     resources: list[tuple[str, bytes, str | None, str | None]] = []
@@ -330,7 +358,6 @@ def parse_mht_to_html(data: bytes, filename: str):
             val = "cid:" + val[4:]
         return val
 
-    # Build map from possible src values to data URLs
     src_map: dict[str, str] = {}
     for ctype, content, cid, loc in resources:
         data_url = f"data:{ctype};base64,{base64.b64encode(content).decode()}"
@@ -370,7 +397,6 @@ def parse_mht_to_html(data: bytes, filename: str):
         if lookup in src_map:
             tag["src"] = src_map[lookup]
         else:
-            # Try basename match
             basename = os.path.basename(lookup)
             if basename in src_map:
                 tag["src"] = src_map[basename]
@@ -380,7 +406,7 @@ def parse_mht_to_html(data: bytes, filename: str):
 
 
 def strip_data_uri_images(html: str) -> str:
-    """Remove data URI image sources to avoid huge payloads in the editor."""
+    """Убираем data-uri картинки для облегчения веса."""
     soup = BeautifulSoup(html or "", "html.parser")
     changed = False
     for img in soup.find_all("img"):
@@ -402,28 +428,31 @@ def main():
     users_df = list_users()
     user_records = list(users_df.itertuples(index=False))
     user_map = {row.login: row.full_name for row in user_records}
+    registered_users = {row.login for row in user_records}
     login_options = [row.login for row in user_records]
 
     stored_login = st.session_state.get("current_user_login")
     db_user = st.session_state.get("db_credentials", {}).get("user")
-    if stored_login and stored_login not in login_options:
-        stored_login = None
-    if not stored_login and db_user in login_options:
-        stored_login = db_user
+    preferred_login: str | None = stored_login or db_user or (login_options[0] if login_options else None)
 
     search_raw = st.sidebar.text_input("Поиск страниц", key="page_search", placeholder="#tag или текст").strip()
     search_tags_only = search_raw.startswith("#")
     search_text = search_raw[1:].strip() if search_tags_only else search_raw
 
-    selected_login: str | None = None
-    if login_options:
-        selected_login = stored_login or login_options[0]
+    # --- выбор текущего пользователя ---
+    selected_login: str | None = preferred_login
+    if selected_login:
         st.session_state["current_user_login"] = selected_login
-        st.sidebar.caption(f"User: {user_map.get(selected_login, selected_login)}")
     else:
-        st.sidebar.info("No users available in the database.")
+        st.sidebar.info("Нет доступных пользователей.")
         return
 
+    welcome_name = _name_patronymic(user_map.get(selected_login), selected_login)
+    st.markdown(f"**Добро пожаловать:** {welcome_name}")
+
+    current_user_can_create_notebook = selected_login in registered_users
+
+    # --- список книг пользователя ---
     notebooks_df = get_notebooks(selected_login)
     allowed_notebook_ids = notebooks_df["id"].astype(int).tolist()
     selected_notebook_id: int | None = None
@@ -431,40 +460,78 @@ def main():
     selected_notebook_row: pd.Series | None = None
 
     notebook_records = list(notebooks_df.itertuples(index=False))
-    if notebook_records:
-        selected_notebook = st.sidebar.selectbox(
-            "Выберите книжку",
-            notebook_records,
-            format_func=lambda row: f"{row.name}{' (закрыта)' if row.closed else ''}",
-        )
-        selected_notebook_id = int(selected_notebook.id)
-        selected_notebook_row = notebooks_df[notebooks_df["id"] == selected_notebook_id].iloc[0]
-    else:
-        st.sidebar.info("Пока записных книжек нет.")
+    top_col1, top_col2, top_col3, top_col4 = st.columns([1.1, 1.1, 1, 1])
 
-    with st.sidebar.expander("? Новая книжка", expanded=False):
-        new_nb_name = st.text_input("Название", key="new_notebook_name")
-        if st.button("Создать записную книжку", key="create_notebook_btn"):
-            create_notebook(new_nb_name, selected_login)
-            st.rerun()
+    # ---------- COL1: выбор и создание блокнота ----------
+    with top_col1:
+        if notebook_records:
+            selected_notebook = st.selectbox(
+                "Записная книга",
+                notebook_records,
+                format_func=lambda row: f"{row.name}{' (закрыта)' if row.closed else ''}",
+                key="notebook_selector",
+            )
+            selected_notebook_id = int(selected_notebook.id)
+            selected_notebook_row = notebooks_df[notebooks_df["id"] == selected_notebook_id].iloc[0]
+        else:
+            st.info("Нет доступных книг")
 
+        if current_user_can_create_notebook:
+            with st.expander("Новая книга", expanded=False):
+                new_nb_name = st.text_input("Новая книга", key="new_notebook_name")
+                if st.button("Создать книгу", key="create_notebook_btn"):
+                    create_notebook(new_nb_name, selected_login)
+                    st.rerun()
+
+    # флаг прав на редактирование книги должен быть определён всегда
     can_edit_notebook = False
-    owners_df = pd.DataFrame()
+
+
+    # ---------- COL2 + COL3: разделы и импорт .mht ----------
+    sections_df = pd.DataFrame()
+    if selected_notebook_id is not None:
+        sections_df = get_sections(selected_notebook_id)
+        section_records = list(sections_df.itertuples(index=False))
+
+        # COL2: выбор раздела + "Новый раздел"
+        with top_col2:
+            if section_records:
+                selected_section = st.selectbox(
+                    "Раздел",
+                    section_records,
+                    format_func=lambda row: row.name,
+                    key="section_selector",
+                )
+                selected_section_id = int(selected_section.id)
+            else:
+                st.warning("В книжке нет разделов.")
+
+            if can_edit_notebook:
+                with st.expander("Новый раздел", expanded=False):
+                    new_section_name = st.text_input("Название раздела", key="new_section_name")
+                    if st.button("Создать раздел", key="create_section_btn"):
+                        create_section(selected_notebook_id, new_section_name, selected_login)
+                        st.rerun()
+
+
+    # ---------- COL4: права доступа ----------
     if selected_notebook_id is not None:
         can_edit_notebook = is_notebook_owner(selected_notebook_id, selected_login)
         owners_df = get_notebook_owners(selected_notebook_id)
-        owners_text = ", ".join(
+        owners_text = " ,".join(
             f"{row.full_name or row.login} ({row.login})" for row in owners_df.itertuples(index=False)
-        ) or "нет владельцев"
-        st.sidebar.caption(f"Владельцы: {owners_text}")
-        st.sidebar.caption(f"Статус: {'закрыта' if selected_notebook_row.closed else 'открыта'}")
+        ) or "Нет владельцев"
+        status_text = "закрыта" if selected_notebook_row.closed else "открыта"
 
         if can_edit_notebook:
-            owner_logins = set(owners_df["login"].tolist())
-            with st.sidebar.expander("Права доступа", expanded=False):
+            #top_col4.markdown("## ")
+            with top_col4.expander("Права доступа на книгу", expanded=False):
+                st.caption(f"Владельцы: {owners_text}")
+                st.caption(f"Статус: {status_text}")
+                owner_logins = set(owners_df["login"].tolist())
                 with st.form(f"access_form_{selected_notebook_id}"):
                     closed_value = st.checkbox(
-                        "Закрытая",
+                        "Закрыть книгу",
                         value=bool(selected_notebook_row.closed),
                         key=f"closed_flag_{selected_notebook_id}",
                     )
@@ -475,62 +542,47 @@ def main():
                         format_func=lambda login: "—" if login == "" else f"{user_map.get(login, login)} ({login})",
                         key=f"add_owner_{selected_notebook_id}",
                     )
-                    submitted = st.form_submit_button("Сохранить настройки")
+                    submitted = st.form_submit_button("Сохранить доступы")
                     if submitted:
                         set_notebook_closed(selected_notebook_id, closed_value)
                         if new_owner_login:
                             add_notebook_owner(selected_notebook_id, new_owner_login)
-                        st.success("Права обновлены")
+                        st.success("Доступы обновлены")
                         st.rerun()
 
-    sections_df = pd.DataFrame()
-    if selected_notebook_id:
-        sections_df = get_sections(selected_notebook_id)
-        section_records = list(sections_df.itertuples(index=False))
-        if section_records:
-            selected_section = st.sidebar.selectbox(
-                "Раздел",
-                section_records,
-                format_func=lambda row: row.name,
-            )
-            selected_section_id = int(selected_section.id)
-        else:
-            st.sidebar.warning("В книжке нет разделов.")
+             # COL4: импорт .mht
+            with top_col4:
+                with st.expander("Import .mht pages", expanded=False):
+                    if not selected_section_id:
+                        st.info("Выберите раздел для импорта.")
+                    else:
+                        uploaded = st.file_uploader(
+                            "Загрузите .mht файлы",
+                            type=["mht"],
+                            accept_multiple_files=True,
+                            key="mht_files",
+                        )
+                        if uploaded and st.button("Импортировать .mht", key="import_mht_btn"):
+                            imported = 0
+                            errors = []
+                            for file in uploaded:
+                                try:
+                                    title, body_html = parse_mht_to_html(file.getvalue(), file.name)
+                                    insert_page_with_content(
+                                        selected_section_id, title, body_html, selected_login
+                                    )
+                                    imported += 1
+                                except Exception as exc:
+                                    errors.append(f"{file.name}: {exc}")
+                            if imported:
+                                st.success(f"Импортировано {imported} страниц")
+                                st.rerun()
+                            if errors:
+                                st.warning(";\n".join(errors))
 
-        if can_edit_notebook:
-            with st.sidebar.expander("? Новый раздел", expanded=False):
-                new_section_name = st.text_input("Название раздела", key="new_section_name")
-                if st.button("Создать раздел", key="create_section_btn"):
-                    create_section(selected_notebook_id, new_section_name, selected_login)
-                    st.rerun()
-        else:
-            st.sidebar.info("Нет прав на создание разделов в этой книжке.")
 
-        with st.sidebar.expander("Import .mht pages", expanded=False):
-            if not selected_section_id:
-                st.info("Выберите раздел для импорта.")
-            elif not can_edit_notebook:
-                st.info("Импорт доступен только владельцам книжки.")
-            else:
-                uploaded = st.file_uploader(
-                    "Загрузите .mht файлы", type=["mht"], accept_multiple_files=True, key="mht_files"
-                )
-                if uploaded and st.button("Импортировать .mht", key="import_mht_btn"):
-                    imported = 0
-                    errors = []
-                    for file in uploaded:
-                        try:
-                            title, body_html = parse_mht_to_html(file.getvalue(), file.name)
-                            insert_page_with_content(selected_section_id, title, body_html, selected_login)
-                            imported += 1
-                        except Exception as exc:
-                            errors.append(f"{file.name}: {exc}")
-                    if imported:
-                        st.success(f"Импортировано {imported} страниц")
-                        st.rerun()
-                    if errors:
-                        st.warning(";\n".join(errors))
 
+    # ---------- Загрузка страниц ----------
     pages_df = load_pages_df(
         selected_notebook_id,
         selected_section_id,
@@ -556,12 +608,10 @@ def main():
             ]
         )
 
-    if selected_section_id and can_edit_notebook and st.sidebar.button("? Новая страница"):
+    if selected_section_id and can_edit_notebook and st.sidebar.button("Новая страница"):
         new_page_id = create_page(selected_section_id, selected_login)
         st.sidebar.success(f"Новая страница ID = {new_page_id}")
         st.rerun()
-    elif selected_section_id and not can_edit_notebook:
-        st.sidebar.info("Нет прав на создание страниц в этой книжке.")
 
     df_display = pages_df[["id", "title"]].copy()
     gb = GridOptionsBuilder.from_dataframe(df_display)
@@ -647,11 +697,11 @@ def main():
                     key=f"confirm_delete_{page_id}",
                 )
                 cols = st.columns([2, 1])
-                if cols[0].button("?? Сохранить изменения", key=f"save_{page_id}"):
+                if cols[0].button("Сохранить изменения", key=f"save_{page_id}"):
                     update_page(page_id, new_title, quill_html, new_tag)
                     st.success("Страница обновлена")
                     st.rerun()
-                if cols[1].button("?? Удалить страницу", key=f"delete_{page_id}", type="secondary"):
+                if cols[1].button("Удалить страницу", key=f"delete_{page_id}", type="secondary"):
                     if confirm_delete:
                         delete_page(page_id)
                         st.success("Страница удалена")
