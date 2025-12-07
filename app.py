@@ -11,6 +11,10 @@ import streamlit as st
 from bs4 import BeautifulSoup
 from st_aggrid import AgGrid, GridOptionsBuilder
 from streamlit_quill import st_quill
+import io
+import re
+from docx import Document
+from xhtml2pdf import pisa
 
 import config
 from src.database_utils_DRP import get_execute, get_fetch, test_connection
@@ -244,7 +248,8 @@ def load_pages_df(
             s.name AS section_name,
             n.id AS notebook_id,
             n.name AS notebook_name,
-            n.closed AS notebook_closed
+            n.closed AS notebook_closed,
+            n.department_id AS notebook_department_id 
         FROM {PAGES_TABLE} p
         JOIN {SECTIONS_TABLE} s ON p.section_id = s.id
         JOIN {NOTEBOOKS_TABLE} n ON s.notebook_id = n.id
@@ -360,8 +365,49 @@ def html_to_body(text: str, fallback_title: str):
     return title, body
 
 
-def parse_mht_to_html(data: bytes, filename: str):
-    """Парсинг .mht, инлайн ресурсов, возврат (title, body_html)."""
+def _split_onenote_html_into_pages(soup: BeautifulSoup, filename: str):
+    """
+    Разбивает HTML из OneNote на «страницы».
+
+    OneNote при экспорте делает по странице блок вида:
+        <div style="direction:ltr;border-width:100%"> ... </div>
+
+    Возвращает список (title, body_html) для каждой страницы.
+    """
+    base_title = filename.rsplit(".", 1)[0]
+
+    # блоки верхнего уровня – каждая страница OneNote
+    page_divs = soup.find_all(
+        "div",
+        style=lambda v: v and "border-width:100%" in v
+    )
+
+    pages: list[tuple[str, str]] = []
+
+    # если не нашли «страничные» div'ы — считаем весь документ одной страницей
+    if not page_divs:
+        title, body_html = html_to_body(str(soup), base_title)
+        pages.append((title, body_html))
+        return pages
+
+    for idx, div in enumerate(page_divs, start=1):
+        # Заголовок страницы — первый <p> внутри блока (как в OneNote)
+        title_p = div.find("p")
+        title_text = title_p.get_text(strip=True) if title_p else ""
+        if not title_text:
+            title_text = f"{base_title} {idx}"
+
+        body_html = str(div)
+        pages.append((title_text, body_html))
+
+    return pages
+
+
+def parse_mht_to_pages(data: bytes, filename: str):
+    """
+    Парсинг .mht, инлайн ресурсов, возврат списка страниц
+    [(title, body_html), ...].
+    """
     msg = email.message_from_bytes(data)
     html_part = None
     resources: list[tuple[str, bytes, str | None, str | None]] = []
@@ -379,7 +425,7 @@ def parse_mht_to_html(data: bytes, filename: str):
                 resources.append((ctype, payload, cid, loc))
 
     if not html_part:
-        raise ValueError("Логин не может быть пустым")
+        raise ValueError("В .mht не найден HTML-контент")
 
     def norm(val: str) -> str:
         val = urllib.parse.unquote(val or "").strip()
@@ -421,6 +467,8 @@ def parse_mht_to_html(data: bytes, filename: str):
                     src_map[key] = data_url
 
     soup = BeautifulSoup(html_part, "html.parser")
+
+    # Подменяем src на data: URL внутри всего документа
     for tag in soup.find_all(src=True):
         src_val = tag.get("src", "")
         lookup = norm(src_val)
@@ -431,8 +479,18 @@ def parse_mht_to_html(data: bytes, filename: str):
             if basename in src_map:
                 tag["src"] = src_map[basename]
 
-    title, body_html = html_to_body(str(soup), filename.rsplit(".", 1)[0])
-    return title, body_html
+    # Разбиваем HTML на логические страницы
+    return _split_onenote_html_into_pages(soup, filename)
+
+
+# Старый интерфейс на всякий случай оставим —
+# он вернёт только первую страницу из файла.
+def parse_mht_to_html(data: bytes, filename: str):
+    pages = parse_mht_to_pages(data, filename)
+    return pages[0]
+
+
+
 
 
 def strip_data_uri_images(html: str) -> str:
@@ -445,6 +503,79 @@ def strip_data_uri_images(html: str) -> str:
             img["src"] = ""
             changed = True
     return str(soup) if changed else html
+
+
+def _safe_filename(title: str, ext: str) -> str:
+    """Простейшая очистка имени файла от недопустимых символов."""
+    base = (title or "page").strip()
+    base = re.sub(r"[^\w\-. ]+", "_", base)
+    if not base:
+        base = "page"
+    return f"{base}.{ext}"
+
+
+def export_html_to_docx_bytes(html: str, title: str) -> io.BytesIO:
+    """Грубый экспорт: HTML -> docx (текст без форматирования)."""
+    doc = Document()
+    if title:
+        doc.add_heading(title, level=1)
+
+    soup = BeautifulSoup(html or "", "html.parser")
+    # Берём только основной текст: абзацы и элементы списка
+    for el in soup.find_all(["h1", "h2", "h3", "p", "li", "pre"]):
+        text = el.get_text(" ", strip=True)
+        if not text:
+            continue
+        if el.name == "li":
+            doc.add_paragraph(text, style="List Bullet")
+        else:
+            doc.add_paragraph(text)
+
+    buf = io.BytesIO()
+    doc.save(buf)
+    buf.seek(0)
+    return buf
+
+
+def export_html_to_pdf_bytes(html: str, title: str) -> io.BytesIO:
+    """HTML -> PDF через xhtml2pdf."""
+    full_html = f"""
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <title>{title}</title>
+      </head>
+      <body>
+        {html}
+      </body>
+    </html>
+    """
+    buf = io.BytesIO()
+    pisa.CreatePDF(full_html, dest=buf, encoding="utf-8")
+    buf.seek(0)
+    return buf
+
+
+def export_html_to_mht_bytes(html: str, title: str) -> io.BytesIO:
+    """
+    Простейший .mht: один HTML без доп.ресурсов.
+    Не OneNote-формат, но нормально открывается в браузере / Word.
+    """
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+
+    msg = MIMEMultipart("related")
+    msg["Subject"] = title or ""
+    alt = MIMEMultipart("alternative")
+    msg.attach(alt)
+    alt.attach(MIMEText(html or "", "html", "utf-8"))
+
+    raw = msg.as_bytes()
+    buf = io.BytesIO(raw)
+    buf.seek(0)
+    return buf
+
+
 
 
 def main():
@@ -508,16 +639,53 @@ def main():
     st.session_state["current_department_id"] = selected_department_id
 
 
+    # --- поле поиска + кнопка очистки ---
 
-    # поле поиска
-    search_raw = st.sidebar.text_input("Поиск страниц", key="page_search", placeholder="#tag или текст").strip()
+    # callback для очистки поля поиска
+    def _clear_page_search():
+        st.session_state["page_search"] = ""
+
+    # заголовок поля
+    st.sidebar.markdown("Поиск страниц")
+
+    # строка: инпут + кнопка "X"
+    search_col, clear_col = st.sidebar.columns([5,2])
+
+    with search_col:
+        search_raw = st.text_input(
+            label="",                       # подпись уже сверху
+            key="page_search",
+            placeholder="#tag или текст",
+            label_visibility="collapsed",   # чтобы не занимала место
+        )
+
+    with clear_col:
+        st.button(
+            "✕",
+            key="clear_page_search",
+            help="Очистить поиск",
+            on_click=_clear_page_search,    # изменяем state через callback
+        )
+
+    # дальнейшая логика разбора строки поиска
+    search_raw = (search_raw or "").strip()
     search_tags_only = search_raw.startswith("#")
     search_text = search_raw[1:].strip() if search_tags_only else search_raw
 
 
 
+    # имя + отчество
     welcome_name = _name_patronymic(user_map.get(selected_login), selected_login)
-    st.markdown(f"**Добро пожаловать:** {welcome_name}")
+
+    # подразделение пользователя
+    user_dep_id = user_dept_map.get(selected_login)
+    user_dep_name = department_map.get(user_dep_id, "") if user_dep_id else ""
+
+    dep_prefix = f"[{user_dep_name}] " if user_dep_name else ""
+
+    st.markdown(f"**Добро пожаловать:** {welcome_name}{'   '}{dep_prefix}")
+
+
 
     current_user_can_create_notebook = selected_login in registered_users
 
@@ -544,8 +712,6 @@ def main():
             )
             filtered_notebooks_df = filtered_notebooks_df[mask]
 
-
-    allowed_notebook_ids = filtered_notebooks_df["id"].astype(int).tolist()
 
     selected_notebook_id: int | None = None
     selected_section_id: int | None = None
@@ -687,18 +853,23 @@ def main():
                             accept_multiple_files=True,
                             key="mht_files",
                         )
+
+
+
                         if uploaded and st.button("Импортировать .mht", key="import_mht_btn"):
                             imported = 0
                             errors = []
                             for file in uploaded:
                                 try:
-                                    title, body_html = parse_mht_to_html(file.getvalue(), file.name)
-                                    insert_page_with_content(
-                                        selected_section_id, title, body_html, selected_login
-                                    )
-                                    imported += 1
+                                    pages = parse_mht_to_pages(file.getvalue(), file.name)
+                                    for title, body_html in pages:
+                                        insert_page_with_content(
+                                            selected_section_id, title, body_html, selected_login
+                                        )
+                                        imported += 1
                                 except Exception as exc:
                                     errors.append(f"{file.name}: {exc}")
+
                             if imported:
                                 st.success(f"Импортировано {imported} страниц")
                                 st.rerun()
@@ -707,14 +878,40 @@ def main():
 
 
 
+
     # ---------- Загрузка страниц ----------
+    # ЛОГИКА:
+    # 1) Если search_text пустой -> показываем страницы выбранной книги/раздела
+    # 2) Если есть текст без #       -> поиск по title/body_html во всех книгах выбранного подразделения
+    # 3) Если строка начинается с #  -> поиск по tag (без #) во всех книгах выбранного подразделения
+
+    # книги, доступные в выбранном подразделении (или все, если "(Все)")
+    dept_notebook_ids = filtered_notebooks_df["id"].astype(int).tolist()
+
+    if search_text:  # есть строка поиска
+        # режим глобального поиска по страницам:
+        # - игнорируем конкретно выбранную книгу и раздел
+        # - ищем только по книгам выбранного подразделения
+        search_notebook_id = None
+        search_section_id = None
+        search_allowed_ids = dept_notebook_ids
+    else:
+        # строка поиска пустая -> обычный режим:
+        # показываем страницы выбранной книги (и раздела)
+        search_notebook_id = selected_notebook_id
+        search_section_id = selected_section_id
+        search_allowed_ids = dept_notebook_ids
+
     pages_df = load_pages_df(
-        selected_notebook_id,
-        selected_section_id,
-        allowed_notebook_ids,
+        search_notebook_id,
+        search_section_id,
+        search_allowed_ids,
         search_text or None,
         search_tags_only,
     )
+
+
+
     if pages_df.empty:
         pages_df = pd.DataFrame(
             columns=[
@@ -730,6 +927,7 @@ def main():
                 "notebook_id",
                 "notebook_name",
                 "notebook_closed",
+                "notebook_department_id", 
             ]
         )
 
@@ -814,14 +1012,23 @@ def main():
             if (pages_df["id"] == stored_page_id).any():
                 page_id = int(stored_page_id)
 
+
+
     if page_id is not None:
         current_page = pages_df[pages_df["id"] == page_id].iloc[0]
         current_title = current_page.get("title", "")
         current_html = current_page.get("body_html") or ""
 
+        # добавляем в подпись подразделение книги
+        dept_id_for_page = current_page.get("notebook_department_id")
+        dept_name_for_page = department_map.get(dept_id_for_page, "") if dept_id_for_page else ""
+        dept_prefix = f"[{dept_name_for_page}] " if dept_name_for_page else ""
+
         st.caption(
-            f"{current_page['notebook_name']} - {current_page['section_name']} - {current_page['title']}"
+            f"{dept_prefix}{current_page['notebook_name']} - "
+            f"{current_page['section_name']} - {current_page['title']}"
         )
+
         if current_page.get("tag"):
             st.caption(f"Tag: {current_page['tag']}")
 
@@ -853,12 +1060,48 @@ def main():
             if forced_edit_page_id == page_id:
                 st.session_state[edit_key] = True
 
-            edit_mode = st.checkbox(
-                "Редактировать страницу",
-                value=st.session_state.get(edit_key, False),
-                key=edit_key,
-            )
+            # ОДНА СТРОКА: слева чекбокс, справа экспандер "Экспорт"
+            col_edit, col_export = st.columns([1, 1])
 
+            with col_edit:
+                edit_mode = st.checkbox(
+                    "Редактировать страницу",
+                    value=st.session_state.get(edit_key, False),
+                    key=edit_key,
+                )
+
+            with col_export:
+                with st.expander("Экспорт", expanded=False):
+                    safe_title = current_title or f"Страница_{page_id}"
+
+                    # .docx
+                    docx_bytes = export_html_to_docx_bytes(current_html, safe_title)
+                    st.download_button(
+                        "Экспорт в .docx",
+                        data=docx_bytes,
+                        file_name=_safe_filename(safe_title, "docx"),
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    )
+
+                    # .pdf
+                    pdf_bytes = export_html_to_pdf_bytes(current_html, safe_title)
+                    st.download_button(
+                        "Экспорт в .pdf",
+                        data=pdf_bytes,
+                        file_name=_safe_filename(safe_title, "pdf"),
+                        mime="application/pdf",
+                    )
+
+                    # .mht
+                    mht_bytes = export_html_to_mht_bytes(current_html, safe_title)
+                    st.download_button(
+                        "Экспорт в .mht",
+                        data=mht_bytes,
+                        file_name=_safe_filename(safe_title, "mht"),
+                        mime="message/rfc822",
+                    )
+
+            # блок редактирования
             if edit_mode:
                 st.markdown("### Редактирование")
 
@@ -875,7 +1118,6 @@ def main():
                     components.html(
                         """
                         <script>
-                        // даём Streamlit дорисовать все виджеты
                         setTimeout(function () {
                           const doc = window.parent.document;
                           const labels = Array.from(doc.querySelectorAll('label'));
@@ -894,7 +1136,6 @@ def main():
                         """,
                         height=0,
                     )
-
 
                 new_tag = st.text_input(
                     "Тег",
