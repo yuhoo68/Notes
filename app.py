@@ -4,16 +4,19 @@ import logging
 import os
 import urllib.parse
 from datetime import datetime
+import requests
 
 import streamlit.components.v1 as components
 import pandas as pd
 import streamlit as st
-from bs4 import BeautifulSoup
+from bs4 import  BeautifulSoup, NavigableString, Tag
 from st_aggrid import AgGrid, GridOptionsBuilder
 from streamlit_quill import st_quill
 import io
 import re
 from docx import Document
+from docx.shared import Pt, Inches
+from docx.enum.text import WD_LINE_SPACING
 from xhtml2pdf import pisa
 
 import config
@@ -26,6 +29,12 @@ SECTIONS_TABLE = f"{SCHEMA}.notes_sections"
 PAGES_TABLE = f"{SCHEMA}.notes_pages"
 OWNERS_TABLE = f"{SCHEMA}.notes_notebook_owners"
 DEPARTMENTS_TABLE = f"{SCHEMA}.notes_departments" 
+
+ACCESS_LABELS = {
+    0: "Все",
+    1: "Сотрудники подразделения",
+    2: "Владельцы книги",
+}
 
 
 logging.basicConfig(
@@ -61,7 +70,7 @@ def ensure_db_credentials() -> dict[str, str]:
 
     @st.dialog("Подключение к базе", width="small")
     def _ask_credentials():
-        st.write("Введите логин и пароль PostgreSQL.")
+        st.write("Введите логин и пароль.")
         with st.form("db_login_form", clear_on_submit=False):
             user = st.text_input("Логин", key="db_login")
             pwd = st.text_input("Пароль", type="password", key="db_password")
@@ -157,15 +166,22 @@ def add_notebook_owner(notebook_id: int, user_login: str) -> None:
     )
 
 
-def set_notebook_closed(notebook_id: int, closed: bool) -> None:
-    logger.info("Изменение статуса книги: id=%s closed=%s", notebook_id, closed)
+def set_notebook_closed(notebook_id: int, closed: int) -> None:
+    """
+    closed:
+      0 – читать могут все
+      1 – читать могут только сотрудники подразделения
+      2 – читать могут только владельцы
+    """
+    logger.info("Изменение режима доступа книги: id=%s closed=%s", notebook_id, closed)
     run_execute(
         f"""
         UPDATE {NOTEBOOKS_TABLE}
-        SET closed = {'TRUE' if closed else 'FALSE'}, updated_at = NOW()
+        SET closed = {int(closed)}, updated_at = NOW()
         WHERE id = {int(notebook_id)}
         """
     )
+
 
 
 def is_notebook_owner(notebook_id: int, user_login: str) -> bool:
@@ -192,26 +208,42 @@ def get_notebook_owners(notebook_id: int) -> pd.DataFrame:
     )
 
 
-def get_notebooks(user_login: str) -> pd.DataFrame:
+def get_notebooks(user_login: str, user_department_id: str | None) -> pd.DataFrame:
+    """
+    Возвращает книги, которые пользователь может хотя бы читать.
+
+    closed = 0  -> видят все
+    closed = 1  -> видят только пользователи того же department_id
+    closed = 2  -> только владельцы
+
+    Владелец книги видит её всегда, независимо от closed и department_id.
+    """
+    dept_condition = ""
+    if user_department_id:
+        dept_condition = f" OR (closed = 1 AND department_id = '{_escape(user_department_id)}')"
+
     return run_fetch_df(
         f"""
         SELECT id,
                name,
-               department_id,        -- NEW
+               department_id,
                created_at,
                updated_at,
                created_by,
                closed
         FROM {NOTEBOOKS_TABLE}
-        WHERE closed = FALSE
-           OR id IN (
-                SELECT notebook_id
-                FROM {OWNERS_TABLE}
-                WHERE user_login = '{_escape(user_login)}'
-           )
+        WHERE
+              id IN (
+                  SELECT notebook_id
+                  FROM {OWNERS_TABLE}
+                  WHERE user_login = '{_escape(user_login)}'
+              )
+           OR closed = 0
+           {dept_condition}
         ORDER BY name
         """
     )
+
 
 
 
@@ -282,10 +314,11 @@ def create_notebook(name: str, user_login: str, department_id: str | None) -> in
     new_id = run_scalar(
         f"""
         INSERT INTO {NOTEBOOKS_TABLE} (name, created_by, closed, department_id)
-        VALUES ('{_escape(cleaned)}', '{_escape(user_login)}', FALSE, {dept_value})
+        VALUES ('{_escape(cleaned)}', '{_escape(user_login)}', 0, {dept_value})
         RETURNING id
         """
     )
+
     if new_id is None:
         raise RuntimeError("Не удалось создать книгу")
     add_notebook_owner(int(new_id), user_login)
@@ -514,27 +547,216 @@ def _safe_filename(title: str, ext: str) -> str:
     return f"{base}.{ext}"
 
 
+
 def export_html_to_docx_bytes(html: str, title: str) -> io.BytesIO:
-    """Грубый экспорт: HTML -> docx (текст без форматирования)."""
+    """
+    Экспорт HTML -> .docx с сохранением базового форматирования,
+    интервалов между абзацами и картинок (data:image/... и http/https).
+    """
     doc = Document()
+
+    # базовый стиль
+    normal_style = doc.styles["Normal"]
+    nf = normal_style.paragraph_format
+    nf.space_before = Pt(0)
+    nf.space_after = Pt(0)
+    nf.line_spacing_rule = WD_LINE_SPACING.SINGLE
+
+    # заголовок документа
     if title:
-        doc.add_heading(title, level=1)
+        h = doc.add_heading(title, level=1)
+        h.paragraph_format.space_before = Pt(0)
+        h.paragraph_format.space_after = Pt(6)
 
     soup = BeautifulSoup(html or "", "html.parser")
-    # Берём только основной текст: абзацы и элементы списка
-    for el in soup.find_all(["h1", "h2", "h3", "p", "li", "pre"]):
-        text = el.get_text(" ", strip=True)
-        if not text:
-            continue
-        if el.name == "li":
-            doc.add_paragraph(text, style="List Bullet")
+    body = soup.body or soup
+
+    # 1. убираем <br> (чтобы не плодить лишние переносы)
+    for br in body.find_all("br"):
+        br.replace_with(" ")
+
+    # 2. чистим \r и \n внутри текстовых узлов
+    for text_node in body.find_all(string=True):
+        cleaned = re.sub(r"[\r\n]+", " ", str(text_node))
+        if cleaned != text_node:
+            text_node.replace_with(cleaned)
+
+    # ---------- вспомогательные функции ----------
+
+    def _update_flags_from_style(tag: Tag, bold: bool, italic: bool, underline: bool):
+        style = (tag.get("style") or "").lower()
+        if "font-weight" in style and ("bold" in style or "700" in style or "600" in style):
+            bold = True
+        if "font-style" in style and "italic" in style:
+            italic = True
+        if "text-decoration" in style and "underline" in style:
+            underline = True
+        return bold, italic, underline
+
+    def add_image_from_tag(tag: Tag):
+        """
+        Вставляет картинку из тега <img>:
+        - data:image/...;base64,...
+        - http(s)://...
+        """
+        src = (tag.get("src") or "").strip()
+        if not src:
+            return
+
+        img_bytes: bytes | None = None
+
+        # 1) data:image/...
+        if src.startswith("data:image"):
+            try:
+                header, b64data = src.split(",", 1)
+                img_bytes = base64.b64decode(b64data)
+            except Exception:
+                return
+
+        # 2) обычный URL
+        elif src.startswith("http://") or src.startswith("https://"):
+            try:
+                resp = requests.get(src, timeout=5)
+                resp.raise_for_status()
+                img_bytes = resp.content
+            except Exception:
+                # если не удалось скачать – просто пропускаем картинку
+                return
         else:
-            doc.add_paragraph(text)
+            # относительные/другие схемы сейчас не поддерживаем
+            return
+
+        if not img_bytes:
+            return
+
+        img_stream = io.BytesIO(img_bytes)
+        img_stream.seek(0)
+        # ширину можно подкорректировать по вкусу
+        doc.add_picture(img_stream, width=Inches(5))
+
+    def add_inline(node, paragraph, bold=False, italic=False, underline=False):
+        if isinstance(node, NavigableString):
+            text = re.sub(r"[\r\n]+", " ", str(node))
+            if not text:
+                return
+            run = paragraph.add_run(text)
+            run.bold = bold
+            run.italic = italic
+            run.underline = underline
+            return
+
+        if not isinstance(node, Tag):
+            return
+
+        name = node.name.lower()
+
+        # картинка внутри абзаца
+        if name == "img":
+            add_image_from_tag(node)
+            return
+
+        tb, ti, tu = bold, italic, underline
+        if name in ("b", "strong"):
+            tb = True
+        if name in ("i", "em"):
+            ti = True
+        if name == "u":
+            tu = True
+
+        tb, ti, tu = _update_flags_from_style(node, tb, ti, tu)
+
+        for child in node.children:
+            add_inline(child, paragraph, tb, ti, tu)
+
+    def make_paragraph(tag: Tag, style: str | None = None):
+        """
+        Создаёт один абзац Word из HTML-тега.
+        Пустые абзацы (&nbsp;/пробелы) оставляем пустыми как визуальные интервалы.
+        """
+        text_raw = tag.get_text("", strip=False)
+        has_any_chars = bool(text_raw and text_raw.strip("\r\n\t "))
+        has_visible_text = bool(tag.get_text("", strip=True))
+        has_img = bool(tag.find("img"))
+        has_br = bool(tag.find("br"))
+
+        if not has_any_chars and not has_img and not has_br:
+            return
+
+        p = doc.add_paragraph(style=style)
+        pf = p.paragraph_format
+        pf.space_before = Pt(0)
+        pf.space_after = Pt(0)
+        pf.line_spacing_rule = WD_LINE_SPACING.SINGLE
+
+        # только «пустой» интервал – оставляем абзац пустым
+        if not has_visible_text and not has_img:
+            return
+
+        for child in tag.children:
+            add_inline(child, p)
+
+    def add_table_from_tag(table_tag: Tag):
+        rows = table_tag.find_all("tr")
+        if not rows:
+            return
+        max_cols = 0
+        row_cells = []
+        for tr in rows:
+            cells = tr.find_all(["td", "th"], recursive=False)
+            row_cells.append(cells)
+            max_cols = max(max_cols, len(cells))
+
+        t = doc.add_table(rows=len(rows), cols=max_cols)
+        t.style = "Table Grid"
+        for i, cells in enumerate(row_cells):
+            for j, cell_tag in enumerate(cells):
+                cell = t.cell(i, j)
+                cell.text = cell_tag.get_text(" ", strip=True)
+
+    def handle_block(node):
+        if isinstance(node, NavigableString):
+            if str(node).strip():
+                p = doc.add_paragraph(str(node).strip())
+                pf = p.paragraph_format
+                pf.space_before = Pt(0)
+                pf.space_after = Pt(0)
+                pf.line_spacing_rule = WD_LINE_SPACING.SINGLE
+            return
+
+        if not isinstance(node, Tag):
+            return
+
+        name = node.name.lower()
+
+        if name in ("h1", "h2", "h3"):
+            level = int(name[1])
+            make_paragraph(node, style=f"Heading {level}")
+        elif name == "p":
+            make_paragraph(node)
+        elif name in ("ul", "ol"):
+            bullet = (name == "ul")
+            for li in node.find_all("li", recursive=False):
+                style = "List Bullet" if bullet else "List Number"
+                make_paragraph(li, style=style)
+        elif name == "img":
+            add_image_from_tag(node)
+        elif name == "table":
+            add_table_from_tag(node)
+        else:
+            for child in node.children:
+                handle_block(child)
+
+    # ---------- основной проход ----------
+    for child in body.children:
+        handle_block(child)
 
     buf = io.BytesIO()
     doc.save(buf)
     buf.seek(0)
     return buf
+
+
+
 
 
 def export_html_to_pdf_bytes(html: str, title: str) -> io.BytesIO:
@@ -574,7 +796,6 @@ def export_html_to_mht_bytes(html: str, title: str) -> io.BytesIO:
     buf = io.BytesIO(raw)
     buf.seek(0)
     return buf
-
 
 
 
@@ -690,7 +911,8 @@ def main():
     current_user_can_create_notebook = selected_login in registered_users
 
     # --- список книг пользователя ---
-    notebooks_df = get_notebooks(selected_login)
+    notebooks_df = get_notebooks(selected_login, user_dep_id)
+
 
     # Отдельный DataFrame для фильтрации поиска по department_id
     filtered_notebooks_df = notebooks_df.copy()
@@ -735,8 +957,17 @@ def main():
                 dept_id = getattr(row, "department_id", None)
                 dept_name = department_map.get(dept_id, "") if dept_id else ""
                 dept_txt = f" [{dept_name}]" if dept_name else ""
-                closed_txt = " (закрыта)" if row.closed else ""
+
+                mode = ACCESS_LABELS.get(int(getattr(row, "closed", 0)), "Все")
+                if mode == "Все":
+                    closed_txt = ""
+                elif mode == "Сотрудники подразделения":
+                    closed_txt = " (только подразделение)"
+                else:  # "Владельцы книги"
+                    closed_txt = " (только владельцы)"
+
                 return f"{row.name}{dept_txt}{closed_txt}"
+
 
             selected_notebook = st.selectbox(
                 "Записная книга",
@@ -815,31 +1046,55 @@ def main():
 
         if can_edit_notebook:
             with top_col4.expander("Права доступа на книгу", expanded=False):
+                closed_mode_current = int(selected_notebook_row.closed or 0)
+                status_text = ACCESS_LABELS.get(closed_mode_current, "Все")
+
                 st.caption(f"Подразделение: {dept_value}")
                 st.caption(f"Владельцы: {owners_text}")
-                st.caption(f"Статус: {status_text}")
-               
+                st.caption(f"Доступ на чтение: {status_text}")
+
                 owner_logins = set(owners_df["login"].tolist())
+
                 with st.form(f"access_form_{selected_notebook_id}"):
-                    closed_value = st.checkbox(
-                        "Закрыть книгу",
-                        value=bool(selected_notebook_row.closed),
-                        key=f"closed_flag_{selected_notebook_id}",
+                    # --- выбор режима доступа на чтение книги ---
+                    labels = list(ACCESS_LABELS.values())
+                    current_label = ACCESS_LABELS.get(closed_mode_current, "Все")
+                    try:
+                        current_index = labels.index(current_label)
+                    except ValueError:
+                        current_index = 0
+
+                    selected_label = st.selectbox(
+                        "Доступ на чтение книги",
+                        options=labels,
+                        index=current_index,
+                        key=f"closed_mode_{selected_notebook_id}",
                     )
-                    selectable_users = [login for login in login_options if login not in owner_logins]
+
+                    # обратно: label -> значение 0/1/2
+                    new_closed_value = next(
+                        k for k, v in ACCESS_LABELS.items() if v == selected_label
+                    )
+
+                    # --- добавление владельца ---
+                    selectable_users = [
+                        login for login in login_options if login not in owner_logins
+                    ]
                     new_owner_login = st.selectbox(
                         "Добавить владельца книги",
                         options=[""] + selectable_users,
                         format_func=lambda login: "—" if login == "" else f"{user_map.get(login, login)} ({login})",
                         key=f"add_owner_{selected_notebook_id}",
                     )
+
                     submitted = st.form_submit_button("Сохранить доступы")
                     if submitted:
-                        set_notebook_closed(selected_notebook_id, closed_value)
+                        set_notebook_closed(selected_notebook_id, new_closed_value)
                         if new_owner_login:
                             add_notebook_owner(selected_notebook_id, new_owner_login)
                         st.success("Доступы обновлены")
                         st.rerun()
+
 
              # COL4: импорт .mht
             with top_col4:
@@ -1053,121 +1308,138 @@ def main():
             scrolling=True,
         )
 
+
+        # --- строка с "Редактировать" (для владельцев) и "Экспорт" (для всех) ---
+        forced_edit_page_id = st.session_state.pop("force_edit_page_id", None)
+        edit_key = f"edit_mode_{page_id}"
+
+        # если только что создали страницу — форсируем включение режима редактирования
+        if can_edit_notebook and forced_edit_page_id == page_id:
+            st.session_state[edit_key] = True
+
+        col_edit, col_export = st.columns([1, 1])
+
+        # левая часть: редактирование (только для владельцев)
+        edit_mode = False
         if can_edit_notebook:
-            # если только что создали страницу — форсируем включение режима редактирования
-            forced_edit_page_id = st.session_state.pop("force_edit_page_id", None)
-            edit_key = f"edit_mode_{page_id}"
-            if forced_edit_page_id == page_id:
-                st.session_state[edit_key] = True
-
-            # ОДНА СТРОКА: слева чекбокс, справа экспандер "Экспорт"
-            col_edit, col_export = st.columns([1, 1])
-
             with col_edit:
                 edit_mode = st.checkbox(
                     "Редактировать страницу",
                     value=st.session_state.get(edit_key, False),
                     key=edit_key,
                 )
-
-            with col_export:
-                with st.expander("Экспорт", expanded=False):
-                    safe_title = current_title or f"Страница_{page_id}"
-
-                    # .docx
-                    docx_bytes = export_html_to_docx_bytes(current_html, safe_title)
-                    st.download_button(
-                        "Экспорт в .docx",
-                        data=docx_bytes,
-                        file_name=_safe_filename(safe_title, "docx"),
-                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    )
-
-                    # .pdf
-                    pdf_bytes = export_html_to_pdf_bytes(current_html, safe_title)
-                    st.download_button(
-                        "Экспорт в .pdf",
-                        data=pdf_bytes,
-                        file_name=_safe_filename(safe_title, "pdf"),
-                        mime="application/pdf",
-                    )
-
-                    # .mht
-                    mht_bytes = export_html_to_mht_bytes(current_html, safe_title)
-                    st.download_button(
-                        "Экспорт в .mht",
-                        data=mht_bytes,
-                        file_name=_safe_filename(safe_title, "mht"),
-                        mime="message/rfc822",
-                    )
-
-            # блок редактирования
-            if edit_mode:
-                st.markdown("### Редактирование")
-
-                title_key = f"title_{page_id}"
-                new_title = st.text_input(
-                    "Название страницы",
-                    value=current_title,
-                    key=title_key,
-                )
-
-                # если это страница, которую только что создали,
-                # переносим фокус в поле заголовка и выделяем текст
-                if forced_edit_page_id == page_id:
-                    components.html(
-                        """
-                        <script>
-                        setTimeout(function () {
-                          const doc = window.parent.document;
-                          const labels = Array.from(doc.querySelectorAll('label'));
-                          const label = labels.find(
-                            l => l.textContent.trim() === 'Название страницы'
-                          );
-                          if (label) {
-                            const input = label.parentElement.querySelector('input');
-                            if (input) {
-                              input.focus();
-                              input.select();
-                            }
-                          }
-                        }, 50);
-                        </script>
-                        """,
-                        height=0,
-                    )
-
-                new_tag = st.text_input(
-                    "Тег",
-                    value=current_page.get("tag") or "",
-                    key=f"tag_{page_id}",
-                )
-                editable_html = strip_data_uri_images(current_html)
-                quill_html = st_quill(
-                    value=editable_html,
-                    html=True,
-                    placeholder="Введите текст...",
-                    key=f"quill_{page_id}",
-                ) or ""
-
-                confirm_delete = st.checkbox(
-                    "Подтвердить удаление",
-                    key=f"confirm_delete_{page_id}",
-                )
-                cols = st.columns([2, 1])
-                if cols[0].button("Сохранить изменения", key=f"save_{page_id}"):
-                    update_page(page_id, new_title, quill_html, new_tag)
-                    st.success("Страница обновлена")
-                    st.rerun()
-                if cols[1].button("Удалить страницу", key=f"delete_{page_id}", type="secondary"):
-                    if confirm_delete:
-                        delete_page(page_id)
-                        st.success("Страница удалена")
-                        st.rerun()
-                    else:
-                        st.warning("Поставьте галочку для подтверждения.")
         else:
+            with col_edit:
+                st.caption("Просмотр (редактирование недоступно)")
+
+        # правая часть: Экспорт (ДОСТУПЕН ВСЕМ)
+        with col_export:
+            with st.expander("Экспорт", expanded=False):
+                safe_title = current_title or f"Страница_{page_id}"
+
+                # .docx
+                docx_bytes = export_html_to_docx_bytes(current_html, safe_title)
+                st.download_button(
+                    "Экспорт в .docx",
+                    data=docx_bytes,
+                    file_name=_safe_filename(safe_title, "docx"),
+                    mime=(
+                        "application/"
+                        "vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    ),
+                )
+
+                # .pdf
+                pdf_bytes = export_html_to_pdf_bytes(current_html, safe_title)
+                st.download_button(
+                    "Экспорт в .pdf",
+                    data=pdf_bytes,
+                    file_name=_safe_filename(safe_title, "pdf"),
+                    mime="application/pdf",
+                )
+
+                # .mht
+                mht_bytes = export_html_to_mht_bytes(current_html, safe_title)
+                st.download_button(
+                    "Экспорт в .mht",
+                    data=mht_bytes,
+                    file_name=_safe_filename(safe_title, "mht"),
+                    mime="message/rfc822",
+                )
+
+        # --- блок редактирования (только для владельцев) ---
+        if can_edit_notebook and edit_mode:
+            st.markdown("### Редактирование")
+
+            title_key = f"title_{page_id}"
+            new_title = st.text_input(
+                "Название страницы",
+                value=current_title,
+                key=title_key,
+            )
+
+            if forced_edit_page_id == page_id:
+                components.html(
+                    """
+                    <script>
+                    setTimeout(function () {
+                      const doc = window.parent.document;
+                      const labels = Array.from(doc.querySelectorAll('label'));
+                      const label = labels.find(
+                        l => l.textContent.trim() === 'Название страницы'
+                      );
+                      if (label) {
+                        const input = label.parentElement.querySelector('input');
+                        if (input) {
+                          input.focus();
+                          input.select();
+                        }
+                      }
+                    }, 50);
+                    </script>
+                    """,
+                    height=0,
+                )
+
+            new_tag = st.text_input(
+                "Тег",
+                value=current_page.get("tag") or "",
+                key=f"tag_{page_id}",
+            )
+            editable_html = strip_data_uri_images(current_html)
+            quill_html = st_quill(
+                value=editable_html,
+                html=True,
+                placeholder="Введите текст...",
+                key=f"quill_{page_id}",
+            ) or ""
+
+            confirm_delete = st.checkbox(
+                "Подтвердить удаление",
+                key=f"confirm_delete_{page_id}",
+            )
+            cols = st.columns([2, 1])
+            if cols[0].button("Сохранить изменения", key=f"save_{page_id}"):
+                update_page(page_id, new_title, quill_html, new_tag)
+                st.success("Страница обновлена")
+                st.rerun()
+            if cols[1].button(
+                "Удалить страницу", key=f"delete_{page_id}", type="secondary"
+            ):
+                if confirm_delete:
+                    delete_page(page_id)
+                    st.success("Страница удалена")
+                    st.rerun()
+                else:
+                    st.warning("Поставьте галочку для подтверждения.")
+
+        elif not can_edit_notebook:
+            # только инфо-сообщение, но Экспорт уже доступен выше
             st.info("У вас права только на просмотр этой записной книжки.")
+
+
+
+
 
 
 if __name__ == "__main__":
