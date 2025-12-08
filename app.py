@@ -19,6 +19,12 @@ from docx.shared import Pt, Inches
 from docx.enum.text import WD_LINE_SPACING
 from xhtml2pdf import pisa
 
+import quopri
+import uuid
+# from reportlab.pdfbase import pdfmetrics
+# from reportlab.pdfbase.ttfonts import TTFont
+
+
 import config
 from src.database_utils_DRP import get_execute, get_fetch, test_connection
 
@@ -42,6 +48,40 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger("notes_app")
+
+
+# !!!Включить в Lunix системе
+# PDF_FONT_REGISTERED = False
+
+# def ensure_pdf_font():
+#     """Регистрирует кириллический шрифт под Linux для xhtml2pdf."""
+#     global PDF_FONT_REGISTERED
+#     if PDF_FONT_REGISTERED:
+#         return
+
+#     # Наиболее надёжный путь для Linux:
+#     possible_paths = [
+#         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+#         "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+#         "/usr/local/share/fonts/DejaVuSans.ttf",
+#     ]
+
+#     font_path = None
+#     for p in possible_paths:
+#         if os.path.exists(p):
+#             font_path = p
+#             break
+
+#     if font_path is None:
+#         raise FileNotFoundError(
+#             "Не найден DejaVuSans.ttf! Установите пакет fonts-dejavu: "
+#             "sudo apt install fonts-dejavu-core"
+#         )
+
+#     pdfmetrics.registerFont(TTFont("MyCyrillic", font_path))
+#     PDF_FONT_REGISTERED = True
+
+
 
 
 def _escape(val: str) -> str:
@@ -760,11 +800,24 @@ def export_html_to_docx_bytes(html: str, title: str) -> io.BytesIO:
 
 
 def export_html_to_pdf_bytes(html: str, title: str) -> io.BytesIO:
-    """HTML -> PDF через xhtml2pdf."""
+    """HTML -> PDF через xhtml2pdf с корректной кириллицей."""
+    #ensure_pdf_font()
+
     full_html = f"""
     <html>
       <head>
         <meta charset="utf-8" />
+        <style>
+          * {{
+            font-family: "MyCyrillic";
+          }}
+          body {{
+            font-family: "MyCyrillic";
+          }}
+          p, span, div {{
+            font-family: "MyCyrillic";
+          }}
+        </style>
         <title>{title}</title>
       </head>
       <body>
@@ -772,30 +825,76 @@ def export_html_to_pdf_bytes(html: str, title: str) -> io.BytesIO:
       </body>
     </html>
     """
+
     buf = io.BytesIO()
     pisa.CreatePDF(full_html, dest=buf, encoding="utf-8")
     buf.seek(0)
     return buf
 
 
+
 def export_html_to_mht_bytes(html: str, title: str) -> io.BytesIO:
     """
-    Простейший .mht: один HTML без доп.ресурсов.
-    Не OneNote-формат, но нормально открывается в браузере / Word.
+    Экспорт страницы в MHTML (.mht), максимально совместимый с IE/Word.
+    Один multipart/related, HTML в cp1251 (если не получится — в utf-8).
     """
-    from email.mime.multipart import MIMEMultipart
-    from email.mime.text import MIMEText
+    import quopri
+    import uuid
 
-    msg = MIMEMultipart("related")
-    msg["Subject"] = title or ""
-    alt = MIMEMultipart("alternative")
-    msg.attach(alt)
-    alt.attach(MIMEText(html or "", "html", "utf-8"))
+    base_template = """<!DOCTYPE html>
+<html>
+  <head>
+    <meta http-equiv="Content-Type" content="text/html; charset={charset}" />
+    <title>{title}</title>
+  </head>
+  <body>
+  {body}
+  </body>
+</html>
+"""
 
-    raw = msg.as_bytes()
-    buf = io.BytesIO(raw)
+    # сначала пытаемся сделать cp1251 — так IE/Word читают без проблем
+    try:
+        charset = "windows-1251"
+        full_html = base_template.format(
+            charset=charset,
+            title=title or "",
+            body=html or "",
+        )
+        html_bytes = full_html.encode(charset)
+    except UnicodeEncodeError:
+        # если вдруг есть символы вне cp1251 — падаем обратно на utf-8
+        charset = "utf-8"
+        full_html = base_template.format(
+            charset=charset,
+            title=title or "",
+            body=html or "",
+        )
+        html_bytes = full_html.encode(charset)
+
+    # quoted-printable
+    qp_html = quopri.encodestring(html_bytes).decode("ascii")
+
+    boundary = "----=_NextPart_" + uuid.uuid4().hex[:8]
+
+    lines = [
+        "MIME-Version: 1.0",
+        f'Content-Type: multipart/related; boundary="{boundary}"',
+        "",
+        f"--{boundary}",
+        f'Content-Type: text/html; charset="{charset}"',
+        "Content-Transfer-Encoding: quoted-printable",
+        "",
+        qp_html,
+        f"--{boundary}--",
+        "",
+    ]
+
+    mht_str = "\r\n".join(lines)
+    buf = io.BytesIO(mht_str.encode("ascii"))
     buf.seek(0)
     return buf
+
 
 
 
@@ -1364,8 +1463,9 @@ def main():
                     "Экспорт в .mht",
                     data=mht_bytes,
                     file_name=_safe_filename(safe_title, "mht"),
-                    mime="message/rfc822",
+                    mime="message/rfc822",   # снова как у «настоящего» .mht
                 )
+
 
         # --- блок редактирования (только для владельцев) ---
         if can_edit_notebook and edit_mode:
