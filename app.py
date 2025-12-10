@@ -9,7 +9,7 @@ import requests
 import streamlit.components.v1 as components
 import pandas as pd
 import streamlit as st
-from bs4 import  BeautifulSoup, NavigableString, Tag
+from bs4 import BeautifulSoup, NavigableString, Tag
 from st_aggrid import AgGrid, GridOptionsBuilder
 from streamlit_quill import st_quill
 import io
@@ -34,7 +34,7 @@ NOTEBOOKS_TABLE = f"{SCHEMA}.notes_notebooks"
 SECTIONS_TABLE = f"{SCHEMA}.notes_sections"
 PAGES_TABLE = f"{SCHEMA}.notes_pages"
 OWNERS_TABLE = f"{SCHEMA}.notes_notebook_owners"
-DEPARTMENTS_TABLE = f"{SCHEMA}.notes_departments" 
+DEPARTMENTS_TABLE = f"{SCHEMA}.notes_departments"
 
 ACCESS_LABELS = {
     0: "Все",
@@ -58,30 +58,28 @@ logger = logging.getLogger("notes_app")
 #     global PDF_FONT_REGISTERED
 #     if PDF_FONT_REGISTERED:
 #         return
-
+#
 #     # Наиболее надёжный путь для Linux:
 #     possible_paths = [
 #         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
 #         "/usr/share/fonts/dejavu/DejaVuSans.ttf",
 #         "/usr/local/share/fonts/DejaVuSans.ttf",
 #     ]
-
+#
 #     font_path = None
 #     for p in possible_paths:
 #         if os.path.exists(p):
 #             font_path = p
 #             break
-
+#
 #     if font_path is None:
 #         raise FileNotFoundError(
 #             "Не найден DejaVuSans.ttf! Установите пакет fonts-dejavu: "
 #             "sudo apt install fonts-dejavu-core"
 #         )
-
+#
 #     pdfmetrics.registerFont(TTFont("MyCyrillic", font_path))
 #     PDF_FONT_REGISTERED = True
-
-
 
 
 def _escape(val: str) -> str:
@@ -178,7 +176,6 @@ def get_departments() -> pd.DataFrame:
     )
 
 
-
 def create_user(login: str, full_name: str) -> str:
     normalized = login.strip().lower()
     if not normalized:
@@ -221,7 +218,6 @@ def set_notebook_closed(notebook_id: int, closed: int) -> None:
         WHERE id = {int(notebook_id)}
         """
     )
-
 
 
 def is_notebook_owner(notebook_id: int, user_login: str) -> bool:
@@ -281,6 +277,25 @@ def get_notebooks(user_login: str, user_department_id: str | None) -> pd.DataFra
            OR closed = 0
            {dept_condition}
         ORDER BY name
+        """
+    )
+
+def get_owned_notebooks(user_login: str) -> pd.DataFrame:
+    """Книги, в которых пользователь является владельцем."""
+    return run_fetch_df(
+        f"""
+        SELECT n.id,
+               n.name,
+               n.department_id,
+               n.created_at,
+               n.updated_at,
+               n.created_by,
+               n.closed
+        FROM {NOTEBOOKS_TABLE} n
+        JOIN {OWNERS_TABLE} o
+          ON o.notebook_id = n.id
+        WHERE o.user_login = '{_escape(user_login)}'
+        ORDER BY n.name
         """
     )
 
@@ -348,7 +363,9 @@ def create_notebook(name: str, user_login: str, department_id: str | None) -> in
     cleaned = name.strip() or "Новая книга"
     logger.info(
         "Создание книги: %s пользователем %s (department_id=%s)",
-        cleaned, user_login, department_id,
+        cleaned,
+        user_login,
+        department_id,
     )
     dept_value = f"'{_escape(department_id)}'" if department_id else "NULL"
     new_id = run_scalar(
@@ -367,7 +384,12 @@ def create_notebook(name: str, user_login: str, department_id: str | None) -> in
 
 def create_section(notebook_id: int, name: str, user_login: str) -> int:
     cleaned = name.strip() or "Новый раздел"
-    logger.info("Создание раздела: %s в книге %s пользователем %s", cleaned, notebook_id, user_login)
+    logger.info(
+        "Создание раздела: %s в книге %s пользователем %s",
+        cleaned,
+        notebook_id,
+        user_login,
+    )
     new_id = run_scalar(
         f"""
         INSERT INTO {SECTIONS_TABLE} (notebook_id, name, created_by)
@@ -396,10 +418,9 @@ def create_page(section_id: int, user_login: str, title: str | None = None) -> i
     return int(new_id)
 
 
-
-
-
-def insert_page_with_content(section_id: int, title: str, body_html: str, user_login: str) -> int:
+def insert_page_with_content(
+    section_id: int, title: str, body_html: str, user_login: str
+) -> int:
     new_id = run_scalar(
         f"""
         INSERT INTO {PAGES_TABLE} (section_id, title, tag, body_html, created_by)
@@ -450,10 +471,7 @@ def _split_onenote_html_into_pages(soup: BeautifulSoup, filename: str):
     base_title = filename.rsplit(".", 1)[0]
 
     # блоки верхнего уровня – каждая страница OneNote
-    page_divs = soup.find_all(
-        "div",
-        style=lambda v: v and "border-width:100%" in v
-    )
+    page_divs = soup.find_all("div", style=lambda v: v and "border-width:100%" in v)
 
     pages: list[tuple[str, str]] = []
 
@@ -563,9 +581,6 @@ def parse_mht_to_html(data: bytes, filename: str):
     return pages[0]
 
 
-
-
-
 def strip_data_uri_images(html: str) -> str:
     """Убираем data-uri картинки для облегчения веса."""
     soup = BeautifulSoup(html or "", "html.parser")
@@ -585,7 +600,6 @@ def _safe_filename(title: str, ext: str) -> str:
     if not base:
         base = "page"
     return f"{base}.{ext}"
-
 
 
 def export_html_to_docx_bytes(html: str, title: str) -> io.BytesIO:
@@ -672,7 +686,13 @@ def export_html_to_docx_bytes(html: str, title: str) -> io.BytesIO:
         img_stream = io.BytesIO(img_bytes)
         img_stream.seek(0)
         # ширину можно подкорректировать по вкусу
-        doc.add_picture(img_stream, width=Inches(5))
+        try:
+            doc.add_picture(img_stream, width=Inches(5))
+        except Exception as e:
+            # Логируем и просто пропускаем проблемное изображение (например, битый TIFF)
+            logger.warning("Не удалось вставить картинку в DOCX: %s", e)
+            return
+
 
     def add_inline(node, paragraph, bold=False, italic=False, underline=False):
         if isinstance(node, NavigableString):
@@ -774,7 +794,7 @@ def export_html_to_docx_bytes(html: str, title: str) -> io.BytesIO:
         elif name == "p":
             make_paragraph(node)
         elif name in ("ul", "ol"):
-            bullet = (name == "ul")
+            bullet = name == "ul"
             for li in node.find_all("li", recursive=False):
                 style = "List Bullet" if bullet else "List Number"
                 make_paragraph(li, style=style)
@@ -796,12 +816,9 @@ def export_html_to_docx_bytes(html: str, title: str) -> io.BytesIO:
     return buf
 
 
-
-
-
 def export_html_to_pdf_bytes(html: str, title: str) -> io.BytesIO:
     """HTML -> PDF через xhtml2pdf с корректной кириллицей."""
-    #ensure_pdf_font()
+    # ensure_pdf_font()
 
     full_html = f"""
     <html>
@@ -832,15 +849,11 @@ def export_html_to_pdf_bytes(html: str, title: str) -> io.BytesIO:
     return buf
 
 
-
 def export_html_to_mht_bytes(html: str, title: str) -> io.BytesIO:
     """
     Экспорт страницы в MHTML (.mht), максимально совместимый с IE/Word.
     Один multipart/related, HTML в cp1251 (если не получится — в utf-8).
     """
-    import quopri
-    import uuid
-
     base_template = """<!DOCTYPE html>
 <html>
   <head>
@@ -896,12 +909,76 @@ def export_html_to_mht_bytes(html: str, title: str) -> io.BytesIO:
     return buf
 
 
-
-
 def main():
     st.set_page_config(
         layout="wide",
-        page_title="OneNote",
+        page_title="ДФИП_Notes",
+        initial_sidebar_state="expanded",   # ← добавили
+    )
+
+
+    # Убираем отступы сверху
+
+    # st.markdown(
+    #     """
+    #     <style>
+    #     /* Убираем верхний отступ основной области */
+    #     .block-container {
+    #         padding-top: 0rem !important;
+    #     }
+    #     </style>
+    #     """,
+    #     unsafe_allow_html=True
+    # )
+
+    # st.markdown(
+    #     """
+    #     <style>
+    #     .block-container {
+    #         padding-top: 0 !important;
+    #         margin-top: 0 !important;
+    #     }
+    #     header[data-testid="stHeader"] {
+    #         height: 0px !important;
+    #     }
+    #     </style>
+    #     """,
+    #     unsafe_allow_html=True
+    # )
+
+
+    st.markdown(
+        """
+        <style>
+        /* Чуть уменьшаем верхний отступ, но не до нуля,
+        чтобы контент не залезал под header */
+        .block-container {
+            padding-top: 0.4rem !important;
+        }
+
+        /* Делаем header более компактным, но не трогаем min-height */
+        header[data-testid="stHeader"] {
+            padding-top: 0;
+            padding-bottom: 0;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+
+
+    # Кастомная ширина сайдбара
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSidebar"] {
+            width: 330px;         /* начальная ширина */
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
 
     ensure_db_credentials()
@@ -909,14 +986,15 @@ def main():
     users_df = list_users()
     user_records = list(users_df.itertuples(index=False))
     user_map = {row.login: row.full_name for row in user_records}
-    user_dept_map = {row.login: row.department_id for row in user_records}  # NEW
+    user_dept_map = {row.login: row.department_id for row in user_records}
     registered_users = {row.login for row in user_records}
     login_options = [row.login for row in user_records]
 
-
     stored_login = st.session_state.get("current_user_login")
     db_user = st.session_state.get("db_credentials", {}).get("user")
-    preferred_login: str | None = stored_login or db_user or (login_options[0] if login_options else None)
+    preferred_login: str | None = (
+        stored_login or db_user or (login_options[0] if login_options else None)
+    )
 
     # --- выбор текущего пользователя ---
     selected_login: str | None = preferred_login
@@ -927,8 +1005,6 @@ def main():
         return
 
 
-
-    # --- выбор подразделения вверху сайдбара ---
     departments_df = get_departments()
     department_map = {
         row.department_id: row.name_department
@@ -936,17 +1012,47 @@ def main():
     }
 
     selected_department_id = "00"
-    dept_records = list(departments_df.itertuples(index=False)) if not departments_df.empty else []
+    dept_records = (
+        list(departments_df.itertuples(index=False)) if not departments_df.empty else []
+    )
 
-    # при создании книги кладём сюда нужный dep_id (используем ОДИН раз)
     forced_department_id = st.session_state.pop("force_department_id", None)
 
     if dept_records:
-        # если нужно форсировать подразделение (после создания книги) – выставляем его
+        # 1) если только что создавали книгу – форсим подразделение книги
         if forced_department_id:
-            forced_row = next((r for r in dept_records if r.department_id == forced_department_id),None,)
+            forced_row = next(
+                (r for r in dept_records if r.department_id == forced_department_id),
+                None,
+            )
             if forced_row is not None:
                 st.session_state["department_selector"] = forced_row
+
+        # 2) если никакого форса нет и selectbox ещё не инициализирован –
+        #    ставим по умолчанию подразделение пользователя,
+        #    а если его нет – строку "Все" (id == "00")
+        if "department_selector" not in st.session_state and not forced_department_id:
+            default_row = None
+
+            # подразделение пользователя из таблицы notes_users
+            user_dep_id = user_dept_map.get(selected_login)
+
+            if user_dep_id:
+                default_row = next(
+                    (r for r in dept_records if r.department_id == user_dep_id),
+                    None,
+                )
+
+            # если пользователя нет в notes_users или dep_id не найден —
+            # берём строку с department_id == "00" (Все),
+            # а если вдруг её нет – первый элемент
+            if default_row is None:
+                default_row = next(
+                    (r for r in dept_records if str(r.department_id) == "00"),
+                    dept_records[0],
+                )
+
+            st.session_state["department_selector"] = default_row
 
         selected_department = st.sidebar.selectbox(
             "Подразделение",
@@ -961,22 +1067,17 @@ def main():
 
     # --- поле поиска + кнопка очистки ---
 
-    # callback для очистки поля поиска
     def _clear_page_search():
         st.session_state["page_search"] = ""
 
-    # заголовок поля
-    st.sidebar.markdown("Поиск страниц")
-
-    # строка: инпут + кнопка "X"
-    search_col, clear_col = st.sidebar.columns([5,2])
+    search_col, clear_col = st.sidebar.columns([12, 2])
 
     with search_col:
         search_raw = st.text_input(
-            label="",                       # подпись уже сверху
+            label="",
             key="page_search",
-            placeholder="#tag или текст",
-            label_visibility="collapsed",   # чтобы не занимала место
+            placeholder="Поиск страниц по #tag или тексту",
+            label_visibility="collapsed",
         )
 
     with clear_col:
@@ -984,15 +1085,12 @@ def main():
             "✕",
             key="clear_page_search",
             help="Очистить поиск",
-            on_click=_clear_page_search,    # изменяем state через callback
+            on_click=_clear_page_search,
         )
 
-    # дальнейшая логика разбора строки поиска
     search_raw = (search_raw or "").strip()
     search_tags_only = search_raw.startswith("#")
     search_text = search_raw[1:].strip() if search_tags_only else search_raw
-
-
 
     # имя + отчество
     welcome_name = _name_patronymic(user_map.get(selected_login), selected_login)
@@ -1003,14 +1101,15 @@ def main():
 
     dep_prefix = f"[{user_dep_name}] " if user_dep_name else ""
 
-    st.markdown(f"**Добро пожаловать:** {welcome_name}{'   '}{dep_prefix}")
-
-
+    #st.markdown(f"**Добро пожаловать:** {welcome_name}{'   '}{dep_prefix}")
 
     current_user_can_create_notebook = selected_login in registered_users
 
     # --- список книг пользователя ---
     notebooks_df = get_notebooks(selected_login, user_dep_id)
+
+    # книги, где пользователь является владельцем (для диалога перемещения/копирования)
+    owned_notebooks_df = get_owned_notebooks(selected_login)
 
 
     # Отдельный DataFrame для фильтрации поиска по department_id
@@ -1021,143 +1120,148 @@ def main():
     if current_department_id != "00":
         prefix = current_department_id.strip()
         if prefix:
-            # Если это верхний уровень (например "01") — добавляем точку,
-            # если уже "01.01", "01.02" и т.п. — оставляем как есть.
             if "." not in prefix:
                 prefix = prefix + "."
-
-            mask = (
-                filtered_notebooks_df["department_id"]
-                .astype(str)
-                .str.startswith(prefix)
+            mask = filtered_notebooks_df["department_id"].astype(str).str.startswith(
+                prefix
             )
             filtered_notebooks_df = filtered_notebooks_df[mask]
-
 
     selected_notebook_id: int | None = None
     selected_section_id: int | None = None
     selected_notebook_row: pd.Series | None = None
+    can_edit_notebook: bool = False
 
     notebook_records = list(filtered_notebooks_df.itertuples(index=False))
-    top_col1, top_col2, top_col3, top_col4 = st.columns([1.1, 1.1, 1, 1])
+    top_col1, top_col2, top_col3 = st.columns([5, 1, 5])
+#, top_col4
 
-    # ---------- COL1: выбор и создание блокнота ----------
-    with top_col1:
-        if notebook_records:
+    # --- диалог "Новая книга" ---
+    if current_user_can_create_notebook:
 
-            # если только что создали книгу — принудительно выбираем её
-            forced_nb_id = st.session_state.pop("force_notebook_id", None)
-            if forced_nb_id is not None:
-                target_row = next((r for r in notebook_records if r.id == forced_nb_id), None)
-                if target_row is not None:
-                    st.session_state["notebook_selector"] = target_row
-
-            def _nb_label(row):
-                dept_id = getattr(row, "department_id", None)
-                dept_name = department_map.get(dept_id, "") if dept_id else ""
-                dept_txt = f" [{dept_name}]" if dept_name else ""
-
-                mode = ACCESS_LABELS.get(int(getattr(row, "closed", 0)), "Все")
-                if mode == "Все":
-                    closed_txt = ""
-                elif mode == "Сотрудники подразделения":
-                    closed_txt = " (только подразделение)"
-                else:  # "Владельцы книги"
-                    closed_txt = " (только владельцы)"
-
-                return f"{row.name}{dept_txt}{closed_txt}"
-
-
-            selected_notebook = st.selectbox(
-                "Записная книга",
-                notebook_records,
-                format_func=_nb_label,
-                key="notebook_selector",
+        @st.dialog("Новая книга", width="small")
+        def new_notebook_dialog():
+            new_nb_name = st.text_input(
+                "Название новой книги",
+                key="new_notebook_name_modal",
             )
-
-            selected_notebook_id = int(selected_notebook.id)
-            selected_notebook_row = filtered_notebooks_df[
-                filtered_notebooks_df["id"] == selected_notebook_id
-            ].iloc[0]
-        else:
-            st.info("Нет доступных книг")
-
-
-        if current_user_can_create_notebook:
-            with st.expander("Новая книга", expanded=False):
-                new_nb_name = st.text_input("Новая книга", key="new_notebook_name")
-                if st.button("Создать книгу", key="create_notebook_btn"):
-                    user_department_id = user_dept_map.get(selected_login)
-                    new_nb_id = create_notebook(new_nb_name, selected_login, user_department_id)
-
-                    # после создания:
-                    # 1) включаем фильтр по департаменту пользователя
-                    if user_department_id:
-                        st.session_state["force_department_id"] = user_department_id
-
-                    # 2) выбираем только что созданную книгу
-                    st.session_state["force_notebook_id"] = new_nb_id
-
-                    st.rerun()
-
-
-    # флаг прав на редактирование книги должен быть определён всегда
-    # флаг прав на редактирование книги
-    can_edit_notebook = bool(selected_notebook_id and is_notebook_owner(selected_notebook_id, selected_login))
-
-    # ---------- COL2 + COL3: разделы и импорт .mht ----------
-    sections_df = pd.DataFrame()
-    if selected_notebook_id is not None:
-        sections_df = get_sections(selected_notebook_id)
-        section_records = list(sections_df.itertuples(index=False))
-
-        # COL2: выбор раздела + "Новый раздел"
-        with top_col2:
-            if section_records:
-                selected_section = st.selectbox(
-                    "Раздел",
-                    section_records,
-                    format_func=lambda row: row.name,
-                    key="section_selector",
+            create_clicked = st.button(
+                "Создать книгу",
+                key="create_notebook_btn_modal",
+            )
+            if create_clicked:
+                user_department_id = user_dept_map.get(selected_login)
+                new_nb_id = create_notebook(
+                    new_nb_name, selected_login, user_department_id
                 )
-                selected_section_id = int(selected_section.id)
+
+                if user_department_id:
+                    st.session_state["force_department_id"] = user_department_id
+                st.session_state["force_notebook_id"] = new_nb_id
+
+                st.success("Книга создана")
+                st.rerun()
+
+    # ---------- COL1: выбор книги + кнопки "+" и "!" ----------
+    with top_col1:
+        select_col, plus_col, info_col = st.columns([14, 2, 2])
+
+        with select_col:
+            if notebook_records:
+
+                forced_nb_id = st.session_state.pop("force_notebook_id", None)
+                if forced_nb_id is not None:
+                    target_row = next(
+                        (r for r in notebook_records if r.id == forced_nb_id), None
+                    )
+                    if target_row is not None:
+                        st.session_state["notebook_selector"] = target_row
+
+                def _nb_label(row):
+                    dept_id = getattr(row, "department_id", None)
+                    dept_name = department_map.get(dept_id, "") if dept_id else ""
+                    dept_txt = f" [{dept_name}]" if dept_name else ""
+
+                    mode = ACCESS_LABELS.get(int(getattr(row, "closed", 0)), "Все")
+                    if mode == "Все":
+                        closed_txt = ""
+                    elif mode == "Сотрудники подразделения":
+                        closed_txt = " (только подразделение)"
+                    else:
+                        closed_txt = " (только владельцы)"
+
+                    return f"{row.name}{dept_txt}{closed_txt}"
+                
+                st.markdown("###### ")
+                st.markdown("###### Записная книга")
+
+                # st.markdown(
+                #     """
+                #     <div style="
+                #         position: relative;
+                #         z-index: 1;
+                #         font-weight: 600;
+                #         font-size: 0.9rem;
+                #         margin-bottom: 0.25rem;
+                #         color: #111111;
+                #     ">
+                #         Записная книга
+                #     </div>
+                #     """,
+                #     unsafe_allow_html=True,
+                # )
+                selected_notebook = st.selectbox(
+                    label="",
+                    options=notebook_records,
+                    format_func=_nb_label,
+                    key="notebook_selector",
+                    label_visibility="collapsed",
+                )
+
+                selected_notebook_id = int(selected_notebook.id)
+                selected_notebook_row = filtered_notebooks_df[
+                    filtered_notebooks_df["id"] == selected_notebook_id
+                ].iloc[0]
+
+                # права на редактирование книги
+                can_edit_notebook = bool(
+                    is_notebook_owner(selected_notebook_id, selected_login)
+                )
             else:
-                st.warning("В книге нет разделов.")
+                st.info("Нет доступных книг")
 
-            if can_edit_notebook:
-                with st.expander("Новый раздел", expanded=False):
-                    new_section_name = st.text_input("Название раздела", key="new_section_name")
-                    if st.button("Создать раздел", key="create_section_btn"):
-                        create_section(selected_notebook_id, new_section_name, selected_login)
-                        st.rerun()
+        # --- диалог "Права доступа на книгу" ---
+        if selected_notebook_id is not None and can_edit_notebook:
 
+            @st.dialog("Права доступа на книгу", width="small")
+            def notebook_access_dialog():
+                owners_df = get_notebook_owners(selected_notebook_id)
+                owners_text = (
+                    ", ".join(
+                        f"{row.full_name or row.login} ({row.login})"
+                        for row in owners_df.itertuples(index=False)
+                    )
+                    or "Нет владельцев"
+                )
 
-    # ---------- COL4: права доступа ----------
-    if selected_notebook_id is not None:
-        owners_df = get_notebook_owners(selected_notebook_id)
-        owners_text = " ,".join(
-            f"{row.full_name or row.login} ({row.login})" for row in owners_df.itertuples(index=False)
-        ) or "Нет владельцев"
-        status_text = "закрыта" if selected_notebook_row.closed else "открыта"
-        dept_id = selected_notebook_row.get("department_id", "")
-        dept_value = department_map.get(dept_id, "не задано")
+                dept_id = selected_notebook_row.get("department_id", "")
+                dept_value = department_map.get(dept_id, "не задано")
 
-
-        if can_edit_notebook:
-            with top_col4.expander("Права доступа на книгу", expanded=False):
                 closed_mode_current = int(selected_notebook_row.closed or 0)
-                status_text = ACCESS_LABELS.get(closed_mode_current, "Все")
-
                 st.caption(f"Подразделение: {dept_value}")
                 st.caption(f"Владельцы: {owners_text}")
-                st.caption(f"Доступ на чтение: {status_text}")
+                st.caption(
+                    "Доступ на чтение: "
+                    + ACCESS_LABELS.get(closed_mode_current, "Все")
+                )
 
                 owner_logins = set(owners_df["login"].tolist())
 
                 with st.form(f"access_form_{selected_notebook_id}"):
-                    # --- выбор режима доступа на чтение книги ---
                     labels = list(ACCESS_LABELS.values())
-                    current_label = ACCESS_LABELS.get(closed_mode_current, "Все")
+                    current_label = ACCESS_LABELS.get(
+                        closed_mode_current, "Все"
+                    )
                     try:
                         current_index = labels.index(current_label)
                     except ValueError:
@@ -1170,19 +1274,20 @@ def main():
                         key=f"closed_mode_{selected_notebook_id}",
                     )
 
-                    # обратно: label -> значение 0/1/2
                     new_closed_value = next(
                         k for k, v in ACCESS_LABELS.items() if v == selected_label
                     )
 
-                    # --- добавление владельца ---
                     selectable_users = [
-                        login for login in login_options if login not in owner_logins
+                        login for login in login_options
+                        if login not in owner_logins
                     ]
                     new_owner_login = st.selectbox(
                         "Добавить владельца книги",
                         options=[""] + selectable_users,
-                        format_func=lambda login: "—" if login == "" else f"{user_map.get(login, login)} ({login})",
+                        format_func=lambda login: "—"
+                        if login == ""
+                        else f"{user_map.get(login, login)} ({login})",
                         key=f"add_owner_{selected_notebook_id}",
                     )
 
@@ -1194,64 +1299,128 @@ def main():
                         st.success("Доступы обновлены")
                         st.rerun()
 
+        # кнопка "+" — создать новую книгу
+        if current_user_can_create_notebook:
+            with plus_col:
+                st.markdown("###### ")
+                st.markdown("###### ")
+                if st.button(
+                    "➕",
+                    key="open_new_notebook_dialog",
+                    help="Создать новую книгу",
+                    use_container_width=True,
+                ):
+                    new_notebook_dialog()
 
-             # COL4: импорт .mht
-            with top_col4:
-                with st.expander("Импорт .mht страниц", expanded=False):
-                    if not selected_section_id:
-                        st.info("Выберите раздел для импорта.")
-                    else:
-                        uploaded = st.file_uploader(
-                            "Загрузите .mht файлы",
-                            type=["mht"],
-                            accept_multiple_files=True,
-                            key="mht_files",
-                        )
+        # кнопка "!" — права доступа на книгу
+        if selected_notebook_id is not None and can_edit_notebook:
+            with info_col:
+                st.markdown("###### ")
+                st.markdown("###### ")
+                if st.button(
+                    "!",
+                    key="open_notebook_access_dialog",
+                    help="Права доступа на книгу",
+                    use_container_width=True,
+                ):
+                    notebook_access_dialog()
 
 
 
-                        if uploaded and st.button("Импортировать .mht", key="import_mht_btn"):
-                            imported = 0
-                            errors = []
-                            for file in uploaded:
-                                try:
-                                    pages = parse_mht_to_pages(file.getvalue(), file.name)
-                                    for title, body_html in pages:
-                                        insert_page_with_content(
-                                            selected_section_id, title, body_html, selected_login
-                                        )
-                                        imported += 1
-                                except Exception as exc:
-                                    errors.append(f"{file.name}: {exc}")
 
-                            if imported:
-                                st.success(f"Импортировано {imported} страниц")
-                                st.rerun()
-                            if errors:
-                                st.warning(";\n".join(errors))
+    # флаг прав на редактирование книги
+    can_edit_notebook = bool(
+        selected_notebook_id
+        and is_notebook_owner(selected_notebook_id, selected_login)
+    )
 
+    # --- диалог "Новый раздел" ---
+    if can_edit_notebook and selected_notebook_id is not None:
+
+        @st.dialog("Новый раздел", width="small")
+        def new_section_dialog():
+            new_section_name = st.text_input(
+                "Название раздела",
+                key="new_section_name_modal",
+            )
+            create_clicked = st.button(
+                "Создать раздел",
+                key="create_section_btn_modal",
+            )
+            if create_clicked:
+                create_section(
+                    selected_notebook_id,
+                    new_section_name,
+                    selected_login,
+                )
+                st.success("Раздел создан")
+                st.rerun()
+
+
+
+    # ---------- COL2 + COL3: разделы ----------
+    sections_df = pd.DataFrame()
+    if selected_notebook_id is not None:
+        sections_df = get_sections(selected_notebook_id)
+        section_records = list(sections_df.itertuples(index=False))
+
+        with top_col3:
+            # поле "Раздел" + кнопка "+"
+            select_col2, plus_col2 = st.columns([14, 2])
+
+            with select_col2:
+                st.markdown("###### ")
+                st.markdown("###### Раздел")
+
+                # st.markdown(
+                #     """
+                #     <div style="
+                #         position: relative;
+                #         z-index: 1;
+                #         font-weight: 600;
+                #         font-size: 0.9rem;
+                #         margin-bottom: 0.25rem;
+                #         color: #111111;
+                #     ">
+                #         Раздел
+                #     </div>
+                #     """,
+                #     unsafe_allow_html=True,
+                # )
+                if section_records:
+                    selected_section = st.selectbox(
+                        label="",
+                        options=section_records,
+                        format_func=lambda row: row.name,
+                        key="section_selector",
+                        label_visibility="collapsed",
+                    )
+                    selected_section_id = int(selected_section.id)
+                else:
+                    st.warning("В книге нет разделов.")
+
+            if can_edit_notebook:
+                with plus_col2:
+                    st.markdown("###### ")
+                    st.markdown("###### ")
+                    if st.button(
+                        "➕",
+                        key="open_new_section_dialog",
+                        help="Создать новый раздел",
+                        use_container_width=True,
+                    ):
+                        new_section_dialog()
 
 
 
     # ---------- Загрузка страниц ----------
-    # ЛОГИКА:
-    # 1) Если search_text пустой -> показываем страницы выбранной книги/раздела
-    # 2) Если есть текст без #       -> поиск по title/body_html во всех книгах выбранного подразделения
-    # 3) Если строка начинается с #  -> поиск по tag (без #) во всех книгах выбранного подразделения
-
-    # книги, доступные в выбранном подразделении (или все, если "(Все)")
     dept_notebook_ids = filtered_notebooks_df["id"].astype(int).tolist()
 
-    if search_text:  # есть строка поиска
-        # режим глобального поиска по страницам:
-        # - игнорируем конкретно выбранную книгу и раздел
-        # - ищем только по книгам выбранного подразделения
+    if search_text:
         search_notebook_id = None
         search_section_id = None
         search_allowed_ids = dept_notebook_ids
     else:
-        # строка поиска пустая -> обычный режим:
-        # показываем страницы выбранной книги (и раздела)
         search_notebook_id = selected_notebook_id
         search_section_id = selected_section_id
         search_allowed_ids = dept_notebook_ids
@@ -1263,8 +1432,6 @@ def main():
         search_text or None,
         search_tags_only,
     )
-
-
 
     if pages_df.empty:
         pages_df = pd.DataFrame(
@@ -1281,43 +1448,76 @@ def main():
                 "notebook_id",
                 "notebook_name",
                 "notebook_closed",
-                "notebook_department_id", 
+                "notebook_department_id",
             ]
         )
 
-
-
-
-
-    # Кнопка "Новая страница" — показываем, если есть права на книгу
+    # ---------- Кнопки "Новая страница" и "Импорт страниц" в сайдбаре ----------
     new_page_clicked = False
+
     if can_edit_notebook:
-        new_page_clicked = st.sidebar.button("Новая страница")
+
+        @st.dialog("Импорт .mht страниц", width="large")
+        def import_mht_dialog():
+            if not selected_section_id:
+                st.info("Выберите раздел для импорта.")
+                return
+
+            uploaded = st.file_uploader(
+                "Загрузите .mht файлы",
+                type=["mht"],
+                accept_multiple_files=True,
+                key="mht_files_modal",
+            )
+
+            if uploaded and st.button("Импортировать .mht", key="import_mht_btn_modal"):
+                imported = 0
+                errors: list[str] = []
+                for file in uploaded:
+                    try:
+                        pages = parse_mht_to_pages(file.getvalue(), file.name)
+                        for title, body_html in pages:
+                            insert_page_with_content(
+                                selected_section_id, title, body_html, selected_login
+                            )
+                            imported += 1
+                    except Exception as exc:
+                        errors.append(f"{file.name}: {exc}")
+
+                if imported:
+                    st.success(f"Импортировано {imported} страниц")
+                    st.rerun()
+                if errors:
+                    st.warning(";\n".join(errors))
+
+        btn_col_new, btn_col_import = st.sidebar.columns([1, 1])
+        with btn_col_new:
+            new_page_clicked = st.button("Новая страница", use_container_width=True)
+        with btn_col_import:
+            import_clicked = st.button(
+                "Импорт страниц", use_container_width=True
+            )
+
+        if import_clicked:
+            import_mht_dialog()
 
     if new_page_clicked:
         if not selected_section_id:
             st.sidebar.warning("Сначала создайте и выберите раздел.")
         else:
-            # создаём страницу с названием по умолчанию "Новая страница"
             new_page_id = create_page(
                 section_id=selected_section_id,
                 user_login=selected_login,
                 title=None,
             )
 
-            # эта страница становится текущей
             st.session_state["current_page_id"] = new_page_id
-            # просим AgGrid выделить её
             st.session_state["force_page_id"] = new_page_id
-            # и сразу включить режим редактирования
             st.session_state["force_edit_page_id"] = new_page_id
 
             st.rerun()
 
-
-
-
-
+    # ---------- Список страниц ----------
     df_display = pages_df[["id", "title"]].copy()
     df_display = df_display.reset_index(drop=True)
 
@@ -1335,7 +1535,6 @@ def main():
         except Exception:
             pass
 
-
     list_container = st.sidebar.container()
     with list_container:
         grid_response = AgGrid(
@@ -1343,10 +1542,9 @@ def main():
             gridOptions=gb.build(),
             enable_enterprise_modules=False,
             update_on=["selectionChanged"],
-            height=400,
+            height=500,
             fit_columns_on_grid_load=True,
         )
-
 
     selected_rows = grid_response.get("selected_rows", [])
     if isinstance(selected_rows, pd.DataFrame):
@@ -1355,12 +1553,10 @@ def main():
     page_id: int | None = None
 
     if selected_rows:
-        # пользователь явно выбрал строку в списке
         row = selected_rows[0]
         page_id = int(row["id"])
         st.session_state["current_page_id"] = page_id
     else:
-        # нет явного выбора — пробуем использовать сохранённую текущую страницу
         stored_page_id = st.session_state.get("current_page_id")
         if stored_page_id is not None and not pages_df.empty:
             if (pages_df["id"] == stored_page_id).any():
@@ -1368,14 +1564,19 @@ def main():
 
 
 
+
+
+    # ---------- Просмотр / редактирование выбранной страницы ----------
     if page_id is not None:
         current_page = pages_df[pages_df["id"] == page_id].iloc[0]
         current_title = current_page.get("title", "")
         current_html = current_page.get("body_html") or ""
+        current_tag = current_page.get("tag") or ""
 
-        # добавляем в подпись подразделение книги
         dept_id_for_page = current_page.get("notebook_department_id")
-        dept_name_for_page = department_map.get(dept_id_for_page, "") if dept_id_for_page else ""
+        dept_name_for_page = (
+            department_map.get(dept_id_for_page, "") if dept_id_for_page else ""
+        )
         dept_prefix = f"[{dept_name_for_page}] " if dept_name_for_page else ""
 
         st.caption(
@@ -1383,8 +1584,8 @@ def main():
             f"{current_page['section_name']} - {current_page['title']}"
         )
 
-        if current_page.get("tag"):
-            st.caption(f"Tag: {current_page['tag']}")
+        if current_tag:
+            st.caption(f"Tag: {current_tag}")
 
         preview_html = f"""
         <style>
@@ -1408,35 +1609,37 @@ def main():
         )
 
 
-        # --- строка с "Редактировать" (для владельцев) и "Экспорт" (для всех) ---
+
+
+
         forced_edit_page_id = st.session_state.pop("force_edit_page_id", None)
         edit_key = f"edit_mode_{page_id}"
 
-        # если только что создали страницу — форсируем включение режима редактирования
         if can_edit_notebook and forced_edit_page_id == page_id:
             st.session_state[edit_key] = True
 
-        col_edit, col_export = st.columns([1, 1])
+        # --- кнопка редактирования + экспорт + перемещение/копирование ---
+        col1, col2, col3, col4 = st.columns([2, 1, 2, 2])
 
-        # левая часть: редактирование (только для владельцев)
+        # col1 — чекбокс "Редактировать страницу"
         edit_mode = False
-        if can_edit_notebook:
-            with col_edit:
+        with col1:
+            if can_edit_notebook:
                 edit_mode = st.checkbox(
                     "Редактировать страницу",
                     value=st.session_state.get(edit_key, False),
                     key=edit_key,
                 )
-        else:
-            with col_edit:
+            else:
                 st.caption("Просмотр (редактирование недоступно)")
 
-        # правая часть: Экспорт (ДОСТУПЕН ВСЕМ)
-        with col_export:
+        # col2 — пока пустая
+
+        # col3 — Expander "Экспорт"
+        with col3:
             with st.expander("Экспорт", expanded=False):
                 safe_title = current_title or f"Страница_{page_id}"
 
-                # .docx
                 docx_bytes = export_html_to_docx_bytes(current_html, safe_title)
                 st.download_button(
                     "Экспорт в .docx",
@@ -1448,7 +1651,6 @@ def main():
                     ),
                 )
 
-                # .pdf
                 pdf_bytes = export_html_to_pdf_bytes(current_html, safe_title)
                 st.download_button(
                     "Экспорт в .pdf",
@@ -1457,17 +1659,138 @@ def main():
                     mime="application/pdf",
                 )
 
-                # .mht
-                mht_bytes = export_html_to_mht_bytes(current_html, safe_title)
-                st.download_button(
-                    "Экспорт в .mht",
-                    data=mht_bytes,
-                    file_name=_safe_filename(safe_title, "mht"),
-                    mime="message/rfc822",   # снова как у «настоящего» .mht
-                )
+        # col4 — Expander "Переместить или скопировать"
+        with col4:
+            # expander теперь виден ВСЕГДА, даже при отсутствии прав на редактирование
+            with st.expander("Переместить или скопировать", expanded=False):
+                st.write(f"Текущая страница: **{current_title or f'ID {page_id}'}**")
+
+                # Книги, где текущий пользователь является владельцем (ограничение назначения)
+                if owned_notebooks_df.empty:
+                    st.info(
+                        "У вас нет записных книг, в которых вы являетесь владельцем. "
+                        "Копирование и перемещение недоступны."
+                    )
+                else:
+                    dest_nb_records = list(owned_notebooks_df.itertuples(index=False))
+
+                    # по умолчанию — текущая книга, если она тоже в owned_notebooks;
+                    # иначе — первая из списка владельца
+                    cur_nb_id = int(current_page["notebook_id"])
+                    default_nb = next(
+                        (r for r in dest_nb_records if int(r.id) == cur_nb_id),
+                        dest_nb_records[0],
+                    )
+                    nb_index = dest_nb_records.index(default_nb)
+
+                    dest_notebook = st.selectbox(
+                        "Записная книга (для копирования/перемещения)",
+                        dest_nb_records,
+                        format_func=lambda r: r.name,
+                        index=nb_index,
+                        key=f"move_nb_{page_id}",
+                    )
+
+                    # разделы выбранной книги
+                    dest_sections_df = get_sections(int(dest_notebook.id))
+                    dest_sec_records = list(dest_sections_df.itertuples(index=False))
+                    if not dest_sec_records:
+                        st.warning(
+                            "В выбранной книге нет разделов. "
+                            "Сначала создайте раздел."
+                        )
+                    else:
+                        # по умолчанию — раздел с таким же id, если он есть в этой книге,
+                        # иначе первый раздел книги
+                        cur_sec_id = int(current_page["section_id"])
+                        default_sec = next(
+                            (r for r in dest_sec_records if int(r.id) == cur_sec_id),
+                            dest_sec_records[0],
+                        )
+                        sec_index = dest_sec_records.index(default_sec)
+
+                        dest_section = st.selectbox(
+                            "Раздел",
+                            dest_sec_records,
+                            format_func=lambda r: r.name,
+                            index=sec_index,
+                            key=f"move_sec_{page_id}",
+                        )
+
+                        col_move, col_copy, col_cancel = st.columns(3)
+
+                        move_clicked = False
+                        with col_move:
+                            if can_edit_notebook:
+                                move_clicked = st.button(
+                                    "Переместить",
+                                    type="primary",
+                                    key=f"btn_move_{page_id}",
+                                    use_container_width=True,
+                                )
+                            else:
+                                st.caption("Перемещение недоступно\n(только владельцы книги)")
+
+                        with col_copy:
+                            copy_clicked = st.button(
+                                "Копировать",
+                                key=f"btn_copy_{page_id}",
+                                use_container_width=True,
+                            )
+                        with col_cancel:
+                            cancel_clicked = st.button(
+                                "Отмена",
+                                key=f"btn_cancel_{page_id}",
+                                use_container_width=True,
+                            )
+
+                        # --- ЛОГИКА ПЕРЕМЕЩЕНИЯ (только владельцы книги) ---
+                        if move_clicked and can_edit_notebook:
+                            run_execute(
+                                f"""
+                                UPDATE {PAGES_TABLE}
+                                SET section_id = {int(dest_section.id)}, updated_at = NOW()
+                                WHERE id = {int(page_id)}
+                                """
+                            )
+                            st.success("Страница перемещена.")
+                            st.session_state["current_page_id"] = page_id
+                            st.session_state["force_page_id"] = page_id
+                            st.rerun()
+
+                        # --- ЛОГИКА КОПИРОВАНИЯ (доступно всем пользователям) ---
+                        if copy_clicked:
+                            new_page_id = run_scalar(
+                                f"""
+                                INSERT INTO {PAGES_TABLE}
+                                    (section_id, title, tag, body_html, created_by)
+                                VALUES
+                                    ({int(dest_section.id)},
+                                     '{_escape(current_title)}',
+                                     '{_escape(current_tag)}',
+                                     '{_escape(current_html)}',
+                                     '{_escape(selected_login)}')
+                                RETURNING id
+                                """
+                            )
+                            if new_page_id is None:
+                                st.error("Не удалось создать копию страницы.")
+                            else:
+                                new_page_id = int(new_page_id)
+                                st.success("Страница скопирована.")
+                                st.session_state["current_page_id"] = new_page_id
+                                st.session_state["force_page_id"] = new_page_id
+                                st.session_state["force_edit_page_id"] = new_page_id
+                                st.rerun()
+
+                        if cancel_clicked:
+                            st.rerun()
 
 
-        # --- блок редактирования (только для владельцев) ---
+
+
+
+
         if can_edit_notebook and edit_mode:
             st.markdown("### Редактирование")
 
@@ -1507,12 +1830,15 @@ def main():
                 key=f"tag_{page_id}",
             )
             editable_html = strip_data_uri_images(current_html)
-            quill_html = st_quill(
-                value=editable_html,
-                html=True,
-                placeholder="Введите текст...",
-                key=f"quill_{page_id}",
-            ) or ""
+            quill_html = (
+                st_quill(
+                    value=editable_html,
+                    html=True,
+                    placeholder="Введите текст...",
+                    key=f"quill_{page_id}",
+                )
+                or ""
+            )
 
             confirm_delete = st.checkbox(
                 "Подтвердить удаление",
@@ -1534,12 +1860,7 @@ def main():
                     st.warning("Поставьте галочку для подтверждения.")
 
         elif not can_edit_notebook:
-            # только инфо-сообщение, но Экспорт уже доступен выше
             st.info("У вас права только на просмотр этой записной книжки.")
-
-
-
-
 
 
 if __name__ == "__main__":

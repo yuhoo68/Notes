@@ -8,7 +8,6 @@ CREATE TABLE IF NOT EXISTS sbx_dfip_ocpp.notes_departments (
 CREATE TABLE IF NOT EXISTS sbx_dfip_ocpp.notes_users (
     login TEXT PRIMARY KEY,
     full_name TEXT NOT NULL,
-    can_create_notebook BOOLEAN NOT NULL DEFAULT FALSE,
     department_id TEXT REFERENCES sbx_dfip_ocpp.notes_departments(department_id)
 );
 
@@ -18,7 +17,7 @@ CREATE TABLE IF NOT EXISTS sbx_dfip_ocpp.notes_notebooks (
     created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
     created_by TEXT REFERENCES sbx_dfip_ocpp.notes_users(login),
-    closed BOOLEAN NOT NULL DEFAULT FALSE,
+    closed INTEGER NOT NULL DEFAULT 0,
     department_id TEXT REFERENCES sbx_dfip_ocpp.notes_departments(department_id)
 );
 
