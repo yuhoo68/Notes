@@ -35,6 +35,7 @@ SECTIONS_TABLE = f"{SCHEMA}.notes_sections"
 PAGES_TABLE = f"{SCHEMA}.notes_pages"
 OWNERS_TABLE = f"{SCHEMA}.notes_notebook_owners"
 DEPARTMENTS_TABLE = f"{SCHEMA}.notes_departments"
+ATTACHMENTS_TABLE = f"{SCHEMA}.notes_page_attachments"
 
 ACCESS_LABELS = {
     0: "Все",
@@ -97,6 +98,18 @@ def _name_patronymic(full_name: str | None, fallback_login: str) -> str:
     if len(parts) >= 2:
         return " ".join(parts[1:])
     return full_name.strip() or fallback_login
+
+
+def _format_file_size(size: int | float | None) -> str:
+    if not size or size <= 0:
+        return ""
+    units = ["B", "KB", "MB", "GB"]
+    value = float(size)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} B"
 
 
 def ensure_db_credentials() -> dict[str, str]:
@@ -449,6 +462,93 @@ def update_page(page_id: int, title: str, body_html: str, tag: str) -> None:
 def delete_page(page_id: int) -> None:
     logger.info("Удаление страницы: id=%s", page_id)
     run_execute(f"DELETE FROM {PAGES_TABLE} WHERE id = {int(page_id)}")
+
+
+def get_page_attachments(page_id: int) -> pd.DataFrame:
+    return run_fetch_df(
+        f"""
+        SELECT id,
+               attachment_type,
+               file_name,
+               mime_type,
+               file_size,
+               url,
+               created_at,
+               created_by
+        FROM {ATTACHMENTS_TABLE}
+        WHERE page_id = {int(page_id)}
+        ORDER BY created_at DESC, id DESC
+        """
+    )
+
+
+def get_attachment_file(attachment_id: int) -> tuple[bytes, str, str] | None:
+    df = run_fetch_df(
+        f"""
+        SELECT file_data, file_name, COALESCE(mime_type, 'application/octet-stream') AS mime_type
+        FROM {ATTACHMENTS_TABLE}
+        WHERE id = {int(attachment_id)} AND attachment_type = 'file'
+        LIMIT 1
+        """
+    )
+    if df.empty:
+        return None
+    data = df.at[0, "file_data"]
+    if data is None:
+        return None
+    if isinstance(data, memoryview):
+        data = data.tobytes()
+    elif isinstance(data, bytearray):
+        data = bytes(data)
+    elif isinstance(data, str):
+        # Pandas can sometimes decode BYTEA to str; best-effort recover bytes
+        data = data.encode("latin1", errors="ignore")
+    return bytes(data), str(df.at[0, "file_name"]), str(df.at[0, "mime_type"])
+
+
+def save_file_attachment(page_id: int, uploaded_file, user_login: str) -> None:
+    if uploaded_file is None:
+        return
+
+    content = uploaded_file.getvalue()
+    if not content:
+        raise ValueError("���� ��� ������ ��� ����������.")
+
+    mime_type = uploaded_file.type or "application/octet-stream"
+    encoded = base64.b64encode(content).decode("ascii")
+    run_execute(
+        f"""
+        INSERT INTO {ATTACHMENTS_TABLE}
+            (page_id, attachment_type, file_name, mime_type, file_size, file_data, created_by)
+        VALUES
+            ({int(page_id)},
+             'file',
+             '{_escape(uploaded_file.name)}',
+             '{_escape(mime_type)}',
+             {len(content)},
+             decode('{encoded}', 'base64'),
+             '{_escape(user_login)}')
+        """
+    )
+
+
+def save_link_attachment(page_id: int, url: str, title: str, user_login: str) -> None:
+    cleaned_url = (url or "").strip()
+    if not cleaned_url:
+        raise ValueError("URL �� ������.")
+    name = (title or "").strip() or cleaned_url
+    run_execute(
+        f"""
+        INSERT INTO {ATTACHMENTS_TABLE}
+            (page_id, attachment_type, file_name, url, created_by)
+        VALUES
+            ({int(page_id)},
+             'link',
+             '{_escape(name)}',
+             '{_escape(cleaned_url)}',
+             '{_escape(user_login)}')
+        """
+    )
 
 
 def html_to_body(text: str, fallback_title: str):
@@ -1615,25 +1715,91 @@ def main():
         forced_edit_page_id = st.session_state.pop("force_edit_page_id", None)
         edit_key = f"edit_mode_{page_id}"
 
+        # инициализация флага редактирования
+        if edit_key not in st.session_state:
+            st.session_state[edit_key] = False
+
+        # если страница только что создана/скопирована — сразу открыть в режиме редактирования
         if can_edit_notebook and forced_edit_page_id == page_id:
             st.session_state[edit_key] = True
 
-        # --- кнопка редактирования + экспорт + перемещение/копирование ---
-        col1, col2, col3, col4 = st.columns([2, 1, 2, 2])
 
-        # col1 — чекбокс "Редактировать страницу"
-        edit_mode = False
+
+        # --- кнопка редактирования + экспорт + перемещение/копирование ---
+        col1, col2, col3, col4 = st.columns([1, 3, 1, 3])
+
+
+
+        # col1 — кнопка-переключатель "Редактировать страницу"
         with col1:
             if can_edit_notebook:
-                edit_mode = st.checkbox(
-                    "Редактировать страницу",
-                    value=st.session_state.get(edit_key, False),
-                    key=edit_key,
-                )
+                is_editing = st.session_state.get(edit_key, False)
+                btn_label = "Закрыть редактор" if is_editing else "Редактировать страницу"
+
+                if st.button(
+                    btn_label,
+                    key=f"toggle_edit_{page_id}",
+                    use_container_width=True,
+                ):
+                    # переключаем режим и перерисовываем страницу
+                    st.session_state[edit_key] = not is_editing
+                    st.rerun()
+
+                edit_mode = st.session_state.get(edit_key, False)
             else:
                 st.caption("Просмотр (редактирование недоступно)")
+                edit_mode = False
 
-        # col2 — пока пустая
+
+
+
+        # col2 - attachment inputs
+        with col2:
+            with st.expander("Файлы и ссылки", expanded=False):
+                if can_edit_notebook:
+                    uploaded_files = st.file_uploader(
+                        "Прикрепить файлы к странице",
+                        accept_multiple_files=True,
+                        key=f"page_attachments_{page_id}",
+                    )
+                    if uploaded_files and st.button(
+                        "Сохранить файлы",
+                        key=f"btn_save_attachments_{page_id}",
+                        use_container_width=True,
+                    ):
+                        saved = 0
+                        errors: list[str] = []
+                        for file in uploaded_files:
+                            try:
+                                save_file_attachment(page_id, file, selected_login)
+                                saved += 1
+                            except Exception as exc:
+                                errors.append(f"{file.name}: {exc}")
+                        if saved:
+                            st.success(f"Прикреплено: {saved}")
+                            st.rerun()
+                        if errors:
+                            st.warning("; ".join(errors))
+
+                    link_title = st.text_input(
+                        "Подпись для ссылки", key=f"page_link_title_{page_id}"
+                    )
+                    link_url = st.text_input("URL", key=f"page_link_url_{page_id}")
+                    if st.button(
+                        "Сохранить ссылку",
+                        key=f"btn_save_link_{page_id}",
+                        use_container_width=True,
+                    ):
+                        try:
+                            save_link_attachment(page_id, link_url, link_title, selected_login)
+                            st.success("Ссылка сохранена")
+                            st.rerun()
+                        except ValueError as exc:
+                            st.warning(str(exc))
+                        except Exception as exc:
+                            st.error(f"Не удалось сохранить ссылку: {exc}")
+                else:
+                    st.caption("Прикреплять файлы могут совладельцы блокнота.")
 
         # col3 — Expander "Экспорт"
         with col3:
@@ -1787,6 +1953,134 @@ def main():
                             st.rerun()
 
 
+
+
+
+        # --- Таблица вложений ---
+        st.markdown("### Файлы и ссылки")
+        attachments_df = get_page_attachments(page_id)
+        if attachments_df.empty:
+            st.info("Прикрепленные файлы и ссылки отсутствуют.")
+        else:
+            att_display = attachments_df.copy()
+            att_display["Размер"] = att_display["file_size"].apply(_format_file_size)
+            att_display["Создано"] = (
+                pd.to_datetime(att_display["created_at"], errors="coerce")
+                .dt.strftime("%Y-%m-%d %H:%M")
+            )
+            att_display["Тип"] = (
+                att_display["attachment_type"]
+                .map({"file": "Файл", "link": "Ссылка"})
+                .fillna(att_display["attachment_type"])
+            )
+            att_display["Название"] = att_display["file_name"]
+            att_display["Автор"] = att_display["created_by"]
+            att_display["URL"] = att_display["url"].fillna("")
+
+            grid_df = att_display[
+                ["id", "Тип", "Название", "Размер", "Создано", "Автор", "URL"]
+            ]
+
+            gb_att = GridOptionsBuilder.from_dataframe(grid_df)
+            # ВАЖНО: без чекбоксов — клик по строке сразу выделяет её
+            gb_att.configure_selection("single", use_checkbox=False)
+            gb_att.configure_column("id", hide=True)
+            gb_att.configure_column("URL", hide=True)
+            gb_att.configure_column("Название", width=240)
+            gb_att.configure_column("Размер", width=90)
+            gb_att.configure_column("Тип", width=80)
+
+            grid_response = AgGrid(
+                grid_df,
+                gridOptions=gb_att.build(),
+                enable_enterprise_modules=False,
+                # как и в списке страниц — реагируем на изменение выделения
+                update_on=["selectionChanged"],
+                height=220,
+                fit_columns_on_grid_load=True,
+            )
+
+            selected_rows = grid_response.get("selected_rows", [])
+            if isinstance(selected_rows, pd.DataFrame):
+                selected_rows = selected_rows.to_dict("records")
+
+            selected_att = selected_rows[0] if selected_rows else None
+
+            # --- эмуляция двойного клика через время между кликами ---
+            double_clicked = False
+            if selected_att:
+                now = datetime.now()
+                click_state_key = f"att_last_click_{page_id}"
+                last = st.session_state.get(click_state_key)
+                att_id = int(selected_att["id"])
+                if last and last.get("id") == att_id:
+                    last_ts = last.get("ts")
+                    if isinstance(last_ts, datetime):
+                        if (now - last_ts).total_seconds() <= 0.8:
+                            double_clicked = True
+                st.session_state[click_state_key] = {"id": att_id, "ts": now}
+
+            if selected_att:
+                att_id = int(selected_att["id"])
+                att_type = selected_att.get("Тип")
+                url_val = selected_att.get("URL") or ""
+
+
+
+
+
+                if att_type == "Файл":
+                    payload = get_attachment_file(att_id)
+                    if payload is None:
+                        st.warning("Файл недоступен.")
+                    else:
+                        file_bytes, file_name, mime_type = payload
+
+                        # узкая колонка под кнопку
+                        btn_col, _ = st.columns([1, 4])
+                        with btn_col:
+                            st.download_button(
+                                "Скачать файл",
+                                data=file_bytes,
+                                file_name=file_name,
+                                mime=mime_type or "application/octet-stream",
+                                key=f"download_selected_attachment_{att_id}",
+                                use_container_width=True,
+                            )
+
+                        # авто-скачивание по двойному клику
+                        if double_clicked:
+                            encoded = base64.b64encode(file_bytes).decode("ascii")
+                            components.html(
+                                f"""
+                                <a id="auto_download_{att_id}" download="{file_name}"
+                                href="data:{mime_type};base64,{encoded}"></a>
+                                <script>
+                                const a = document.getElementById("auto_download_{att_id}");
+                                if (a) {{ a.click(); }}
+                                </script>
+                                """,
+                                height=0,
+                            )
+
+                elif att_type == "Ссылка":
+                    if not url_val:
+                        st.warning("Ссылка не указана.")
+                    else:
+                        btn_col, _ = st.columns([1, 4])
+                        with btn_col:
+                            st.markdown(f"[Открыть ссылку]({url_val})")
+
+                        # авто-открытие по двойному клику
+                        if double_clicked:
+                            components.html(
+                                f"""
+                                <script>
+                                window.open("{url_val}", "_blank");
+                                </script>
+                                """,
+                                height=0,
+                            )
 
 
 
