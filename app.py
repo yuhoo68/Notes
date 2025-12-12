@@ -5,12 +5,14 @@ import os
 import urllib.parse
 from datetime import datetime
 import requests
+import html
+import json
 
 import streamlit.components.v1 as components
 import pandas as pd
 import streamlit as st
 from bs4 import BeautifulSoup, NavigableString, Tag
-from st_aggrid import AgGrid, GridOptionsBuilder
+from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
 from streamlit_quill import st_quill
 import io
 import re
@@ -215,6 +217,20 @@ def add_notebook_owner(notebook_id: int, user_login: str) -> None:
         """
     )
 
+def remove_notebook_owner(notebook_id: int, user_login: str) -> None:
+    """Удалить пользователя из владельцев книги."""
+    logger.info(
+        "Удаление владельца: notebook_id=%s user=%s", notebook_id, user_login
+    )
+    run_execute(
+        f"""
+        DELETE FROM {OWNERS_TABLE}
+        WHERE notebook_id = {int(notebook_id)}
+          AND user_login = '{_escape(user_login)}'
+        """
+    )
+
+
 
 def set_notebook_closed(notebook_id: int, closed: int) -> None:
     """
@@ -414,6 +430,39 @@ def create_section(notebook_id: int, name: str, user_login: str) -> int:
         raise RuntimeError("Не удалось создать раздел")
     return int(new_id)
 
+def rename_section(section_id: int, new_name: str) -> None:
+    """Переименовать раздел."""
+    cleaned = (new_name or "").strip() or "Новый раздел"
+    run_execute(
+        f"""
+        UPDATE {SECTIONS_TABLE}
+        SET name = '{_escape(cleaned)}', updated_at = NOW()
+        WHERE id = {int(section_id)}
+        """
+    )
+
+
+def get_section_pages_count(section_id: int) -> int:
+    """Количество страниц в разделе."""
+    cnt = run_scalar(
+        f"""
+        SELECT COUNT(*)
+        FROM {PAGES_TABLE}
+        WHERE section_id = {int(section_id)}
+        """
+    )
+    return int(cnt or 0)
+
+
+def delete_section(section_id: int) -> None:
+    """Удалить раздел (предполагается, что страниц уже нет)."""
+    run_execute(
+        f"DELETE FROM {SECTIONS_TABLE} WHERE id = {int(section_id)}"
+    )
+
+
+
+
 
 def create_page(section_id: int, user_login: str, title: str | None = None) -> int:
     """Создать пустую страницу в разделе."""
@@ -481,29 +530,81 @@ def get_page_attachments(page_id: int) -> pd.DataFrame:
         """
     )
 
+def delete_attachment(attachment_id: int) -> None:
+    """Удалить одно вложение (файл или ссылку) по id."""
+    logger.info("Удаление вложения: id=%s", attachment_id)
+    run_execute(
+        f"DELETE FROM {ATTACHMENTS_TABLE} WHERE id = {int(attachment_id)}"
+    )
+
+
+
 
 def get_attachment_file(attachment_id: int) -> tuple[bytes, str, str] | None:
+    """
+    Читает файл-вложение как base64-текст (encode(file_data,'base64')),
+    декодирует в bytes и возвращает (bytes, file_name, mime_type).
+
+    Используем run_fetch_df, чтобы не ломать общий контракт с БД.
+    """
     df = run_fetch_df(
         f"""
-        SELECT file_data, file_name, COALESCE(mime_type, 'application/octet-stream') AS mime_type
+        SELECT
+            encode(file_data, 'base64') AS file_b64,
+            file_name,
+            COALESCE(mime_type, 'application/octet-stream') AS mime_type,
+            file_size
         FROM {ATTACHMENTS_TABLE}
         WHERE id = {int(attachment_id)} AND attachment_type = 'file'
         LIMIT 1
         """
     )
+
     if df.empty:
         return None
-    data = df.at[0, "file_data"]
-    if data is None:
+
+    file_b64 = df.at[0, "file_b64"]
+    file_name = str(df.at[0, "file_name"])
+    mime_type = str(df.at[0, "mime_type"])
+    file_size = df.at[0, "file_size"]
+
+    if file_b64 is None:
         return None
-    if isinstance(data, memoryview):
-        data = data.tobytes()
-    elif isinstance(data, bytearray):
-        data = bytes(data)
-    elif isinstance(data, str):
-        # Pandas can sometimes decode BYTEA to str; best-effort recover bytes
-        data = data.encode("latin1", errors="ignore")
-    return bytes(data), str(df.at[0, "file_name"]), str(df.at[0, "mime_type"])
+
+    # Приводим base64 к строке и убираем переводы строк/пробелы
+    if isinstance(file_b64, (bytes, bytearray, memoryview)):
+        file_b64 = file_b64.decode("ascii", errors="ignore")
+    else:
+        file_b64 = str(file_b64)
+
+    file_b64 = file_b64.replace("\n", "").replace("\r", "").strip()
+
+    try:
+        data = base64.b64decode(file_b64, validate=False)
+    except Exception as e:
+        logger.error(
+            "Не удалось раскодировать base64 для вложения %s: %s",
+            attachment_id,
+            e,
+        )
+        return None
+
+    # Самопроверка по размеру
+    try:
+        if file_size and int(file_size) != len(data):
+            logger.warning(
+                "Размер файла не совпадает: file_size=%s, len(data)=%s, attachment_id=%s",
+                file_size,
+                len(data),
+                attachment_id,
+            )
+    except Exception:
+        pass
+
+    return data, file_name, mime_type
+
+
+
 
 
 def save_file_attachment(page_id: int, uploaded_file, user_login: str) -> None:
@@ -530,6 +631,8 @@ def save_file_attachment(page_id: int, uploaded_file, user_login: str) -> None:
              '{_escape(user_login)}')
         """
     )
+
+
 
 
 def save_link_attachment(page_id: int, url: str, title: str, user_login: str) -> None:
@@ -702,6 +805,9 @@ def _safe_filename(title: str, ext: str) -> str:
     return f"{base}.{ext}"
 
 
+
+
+
 def export_html_to_docx_bytes(html: str, title: str) -> io.BytesIO:
     """
     Экспорт HTML -> .docx с сохранением базового форматирования,
@@ -785,14 +891,11 @@ def export_html_to_docx_bytes(html: str, title: str) -> io.BytesIO:
 
         img_stream = io.BytesIO(img_bytes)
         img_stream.seek(0)
-        # ширину можно подкорректировать по вкусу
         try:
             doc.add_picture(img_stream, width=Inches(5))
         except Exception as e:
-            # Логируем и просто пропускаем проблемное изображение (например, битый TIFF)
             logger.warning("Не удалось вставить картинку в DOCX: %s", e)
             return
-
 
     def add_inline(node, paragraph, bold=False, italic=False, underline=False):
         if isinstance(node, NavigableString):
@@ -810,7 +913,6 @@ def export_html_to_docx_bytes(html: str, title: str) -> io.BytesIO:
 
         name = node.name.lower()
 
-        # картинка внутри абзаца
         if name == "img":
             add_image_from_tag(node)
             return
@@ -848,7 +950,6 @@ def export_html_to_docx_bytes(html: str, title: str) -> io.BytesIO:
         pf.space_after = Pt(0)
         pf.line_spacing_rule = WD_LINE_SPACING.SINGLE
 
-        # только «пустой» интервал – оставляем абзац пустым
         if not has_visible_text and not has_img:
             return
 
@@ -916,97 +1017,86 @@ def export_html_to_docx_bytes(html: str, title: str) -> io.BytesIO:
     return buf
 
 
-def export_html_to_pdf_bytes(html: str, title: str) -> io.BytesIO:
-    """HTML -> PDF через xhtml2pdf с корректной кириллицей."""
-    # ensure_pdf_font()
-
-    full_html = f"""
-    <html>
-      <head>
-        <meta charset="utf-8" />
-        <style>
-          * {{
-            font-family: "MyCyrillic";
-          }}
-          body {{
-            font-family: "MyCyrillic";
-          }}
-          p, span, div {{
-            font-family: "MyCyrillic";
-          }}
-        </style>
-        <title>{title}</title>
-      </head>
-      <body>
-        {html}
-      </body>
-    </html>
+def _html_to_plain_preserving_layout(html: str) -> str:
     """
-
-    buf = io.BytesIO()
-    pisa.CreatePDF(full_html, dest=buf, encoding="utf-8")
-    buf.seek(0)
-    return buf
-
-
-def export_html_to_mht_bytes(html: str, title: str) -> io.BytesIO:
+    Преобразует HTML в текст, максимально сохраняя визуальную структуру:
+    - каждый <p>/<div>/<pre>/<h1-6>/<li> -> отдельная строка/пара строк
+    - <br> внутри блока даёт перевод строки
+    - пустые абзацы превращаются в пустые строки
     """
-    Экспорт страницы в MHTML (.mht), максимально совместимый с IE/Word.
-    Один multipart/related, HTML в cp1251 (если не получится — в utf-8).
+    if not html:
+        return ""
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    # <br> считаем настоящими переводами строки
+    for br in soup.find_all("br"):
+        br.replace_with("\n")
+
+    body = soup.body or soup
+
+    lines: list[str] = []
+
+    def extract_block_text(block: Tag):
+        """Берём весь текст внутри блока, не вставляя \n между span'ами."""
+        parts: list[str] = []
+        for elem in block.descendants:
+            if isinstance(elem, NavigableString):
+                parts.append(str(elem))
+        raw = "".join(parts)
+
+        # заменяем неразрывные пробелы
+        raw = raw.replace("\xa0", " ")
+
+        # если абзац фактически пустой (только пробелы/переводы строк) – это пустая строка
+        if raw.replace("\n", "").strip() == "":
+            lines.append("")
+            return
+
+        # схлопываем только пробелы и табы, но НЕ \n
+        raw = re.sub(r"[ \t\r\f\v]+", " ", raw)
+        # нормализуем пробелы вокруг переводов строк
+        raw = re.sub(r" *\n *", "\n", raw)
+
+        lines.append(raw.strip())
+
+    from bs4 import NavigableString
+
+    # Обходим только верхний уровень body – так каждая <p> станет отдельной строкой
+    for child in body.children:
+        if isinstance(child, NavigableString):
+            txt = str(child)
+            if txt.strip():
+                lines.append(txt.strip())
+        elif isinstance(child, Tag):
+            if child.name in ("p", "div", "pre", "h1", "h2", "h3", "h4", "h5", "h6", "li"):
+                extract_block_text(child)
+
+    return "\n".join(lines).rstrip()
+
+
+def export_html_to_sql_bytes(html: str, title: str, encoding: str = "utf-8") -> bytes:
     """
-    base_template = """<!DOCTYPE html>
-<html>
-  <head>
-    <meta http-equiv="Content-Type" content="text/html; charset={charset}" />
-    <title>{title}</title>
-  </head>
-  <body>
-  {body}
-  </body>
-</html>
-"""
+    Экспорт HTML-страницы в .sql-файл (обычный текст):
 
-    # сначала пытаемся сделать cp1251 — так IE/Word читают без проблем
-    try:
-        charset = "windows-1251"
-        full_html = base_template.format(
-            charset=charset,
-            title=title or "",
-            body=html or "",
-        )
-        html_bytes = full_html.encode(charset)
-    except UnicodeEncodeError:
-        # если вдруг есть символы вне cp1251 — падаем обратно на utf-8
-        charset = "utf-8"
-        full_html = base_template.format(
-            charset=charset,
-            title=title or "",
-            body=html or "",
-        )
-        html_bytes = full_html.encode(charset)
+    -- <Название страницы>
 
-    # quoted-printable
-    qp_html = quopri.encodestring(html_bytes).decode("ascii")
+    <текст страницы с сохранёнными переносами/пустыми строками>
 
-    boundary = "----=_NextPart_" + uuid.uuid4().hex[:8]
+    ВСЕГДА возвращает bytes.
+    """
+    plain = _html_to_plain_preserving_layout(html or "")
 
-    lines = [
-        "MIME-Version: 1.0",
-        f'Content-Type: multipart/related; boundary="{boundary}"',
-        "",
-        f"--{boundary}",
-        f'Content-Type: text/html; charset="{charset}"',
-        "Content-Transfer-Encoding: quoted-printable",
-        "",
-        qp_html,
-        f"--{boundary}--",
-        "",
-    ]
+    header = f"-- {title or ''}".rstrip()
 
-    mht_str = "\r\n".join(lines)
-    buf = io.BytesIO(mht_str.encode("ascii"))
-    buf.seek(0)
-    return buf
+    if plain:
+        full_text = header + "\n\n" + plain
+    else:
+        full_text = header + "\n"
+
+    return full_text.encode(encoding, errors="replace")
+
+
 
 
 def main():
@@ -1358,6 +1448,7 @@ def main():
                 owner_logins = set(owners_df["login"].tolist())
 
                 with st.form(f"access_form_{selected_notebook_id}"):
+                    # --- режим доступа на чтение ---
                     labels = list(ACCESS_LABELS.values())
                     current_label = ACCESS_LABELS.get(
                         closed_mode_current, "Все"
@@ -1373,11 +1464,11 @@ def main():
                         index=current_index,
                         key=f"closed_mode_{selected_notebook_id}",
                     )
-
                     new_closed_value = next(
                         k for k, v in ACCESS_LABELS.items() if v == selected_label
                     )
 
+                    # --- добавление владельца ---
                     selectable_users = [
                         login for login in login_options
                         if login not in owner_logins
@@ -1391,13 +1482,43 @@ def main():
                         key=f"add_owner_{selected_notebook_id}",
                     )
 
+                    # --- удаление владельца (кроме текущего пользователя) ---
+                    removable_owners = [
+                        login for login in owner_logins
+                        if login != selected_login
+                    ]
+
+                    remove_owner_login = st.selectbox(
+                        "Удалить владельца книги",
+                        options=[""] + removable_owners,
+                        format_func=lambda login: "—"
+                        if login == ""
+                        else f"{user_map.get(login, login)} ({login})",
+                        key=f"remove_owner_{selected_notebook_id}",
+                    )
+
                     submitted = st.form_submit_button("Сохранить доступы")
                     if submitted:
+                        # сохраняем режим закрытости
                         set_notebook_closed(selected_notebook_id, new_closed_value)
+
+                        # добавление владельца
                         if new_owner_login:
                             add_notebook_owner(selected_notebook_id, new_owner_login)
+
+                        # удаление владельца
+                        if remove_owner_login:
+                            # на всякий случай не даём удалить себя
+                            if remove_owner_login != selected_login:
+                                remove_notebook_owner(
+                                    selected_notebook_id, remove_owner_login
+                                )
+
                         st.success("Доступы обновлены")
                         st.rerun()
+
+
+
 
         # кнопка "+" — создать новую книгу
         if current_user_can_create_notebook:
@@ -1418,7 +1539,7 @@ def main():
                 st.markdown("###### ")
                 st.markdown("###### ")
                 if st.button(
-                    "!",
+                    "🔐",
                     key="open_notebook_access_dialog",
                     help="Права доступа на книгу",
                     use_container_width=True,
@@ -1458,58 +1579,110 @@ def main():
 
 
 
+
+    # --- диалог "Переименовать / удалить раздел" ---
+    if can_edit_notebook and selected_notebook_id is not None:
+
+        @st.dialog("Переименовать или удалить раздел", width="small")
+        def section_manage_dialog(section_row):
+            section_id_local = int(section_row.id)
+            st.caption(f"Текущий раздел: **{section_row.name}**")
+
+            new_name = st.text_input(
+                "Новое название раздела",
+                value=section_row.name,
+                key=f"rename_section_name_{section_id_local}",
+            )
+
+            pages_cnt = get_section_pages_count(section_id_local)
+
+            col_rename, col_delete = st.columns(2)
+
+            with col_rename:
+                if st.button(
+                    "Сохранить название",
+                    key=f"btn_rename_section_{section_id_local}",
+                    use_container_width=True,
+                ):
+                    rename_section(section_id_local, new_name)
+                    st.success("Название раздела обновлено")
+                    st.rerun()
+
+            with col_delete:
+                if pages_cnt > 0:
+                    st.caption(
+                        f"В разделе есть страницы ({pages_cnt}). Удаление недоступно."
+                    )
+                else:
+                    if st.button(
+                        "Удалить раздел",
+                        key=f"btn_delete_section_{section_id_local}",
+                        use_container_width=True,
+                        type="secondary",
+                    ):
+                        delete_section(section_id_local)
+                        st.success("Раздел удалён")
+                        st.rerun()
+
+
+
+
     # ---------- COL2 + COL3: разделы ----------
     sections_df = pd.DataFrame()
     if selected_notebook_id is not None:
         sections_df = get_sections(selected_notebook_id)
         section_records = list(sections_df.itertuples(index=False))
 
-        with top_col3:
-            # поле "Раздел" + кнопка "+"
-            select_col2, plus_col2 = st.columns([14, 2])
 
-            with select_col2:
+
+    with top_col3:
+        # поле "Раздел" + кнопка "+" + кнопка "Переименовать/Удалить"
+        select_col2, plus_col2, manage_col2 = st.columns([14, 2, 2])
+
+        selected_section = None  # по умолчанию
+
+        with select_col2:
+            st.markdown("###### ")
+            st.markdown("###### Раздел")
+
+            if section_records:
+                selected_section = st.selectbox(
+                    label="",
+                    options=section_records,
+                    format_func=lambda row: row.name,
+                    key="section_selector",
+                    label_visibility="collapsed",
+                )
+                selected_section_id = int(selected_section.id)
+            else:
+                st.warning("В книге нет разделов.")
+
+        # "+" — создать новый раздел
+        if can_edit_notebook:
+            with plus_col2:
                 st.markdown("###### ")
-                st.markdown("###### Раздел")
+                st.markdown("###### ")
+                if st.button(
+                    "➕",
+                    key="open_new_section_dialog",
+                    help="Создать новый раздел",
+                    use_container_width=True,
+                ):
+                    new_section_dialog()
 
-                # st.markdown(
-                #     """
-                #     <div style="
-                #         position: relative;
-                #         z-index: 1;
-                #         font-weight: 600;
-                #         font-size: 0.9rem;
-                #         margin-bottom: 0.25rem;
-                #         color: #111111;
-                #     ">
-                #         Раздел
-                #     </div>
-                #     """,
-                #     unsafe_allow_html=True,
-                # )
-                if section_records:
-                    selected_section = st.selectbox(
-                        label="",
-                        options=section_records,
-                        format_func=lambda row: row.name,
-                        key="section_selector",
-                        label_visibility="collapsed",
-                    )
-                    selected_section_id = int(selected_section.id)
-                else:
-                    st.warning("В книге нет разделов.")
-
-            if can_edit_notebook:
-                with plus_col2:
-                    st.markdown("###### ")
-                    st.markdown("###### ")
+            # новая кнопка "Переименовать/Удалить"
+            with manage_col2:
+                st.markdown("###### ")
+                st.markdown("###### ")
+                if selected_section is not None:
                     if st.button(
-                        "➕",
-                        key="open_new_section_dialog",
-                        help="Создать новый раздел",
+                        "✎",  # можно заменить на любой из предложенных символов
+                        key="open_section_manage_dialog",
+                        help="Переименовать или удалить раздел",
                         use_container_width=True,
                     ):
-                        new_section_dialog()
+                        section_manage_dialog(selected_section)
+
 
 
 
@@ -1642,7 +1815,7 @@ def main():
             gridOptions=gb.build(),
             enable_enterprise_modules=False,
             update_on=["selectionChanged"],
-            height=500,
+            height=650,
             fit_columns_on_grid_load=True,
         )
 
@@ -1710,8 +1883,6 @@ def main():
 
 
 
-
-
         forced_edit_page_id = st.session_state.pop("force_edit_page_id", None)
         edit_key = f"edit_mode_{page_id}"
 
@@ -1722,15 +1893,17 @@ def main():
         # если страница только что создана/скопирована — сразу открыть в режиме редактирования
         if can_edit_notebook and forced_edit_page_id == page_id:
             st.session_state[edit_key] = True
+            # помечаем, что этой странице надо отдать фокус
+            st.session_state["focus_title_page_id"] = page_id
+
 
 
 
         # --- кнопка редактирования + экспорт + перемещение/копирование ---
-        col1, col2, col3, col4 = st.columns([1, 3, 1, 3])
+        col1, col2, col3, col4 = st.columns([1.3, 2.4, 1.2, 3])
 
 
 
-        # col1 — кнопка-переключатель "Редактировать страницу"
         with col1:
             if can_edit_notebook:
                 is_editing = st.session_state.get(edit_key, False)
@@ -1741,8 +1914,11 @@ def main():
                     key=f"toggle_edit_{page_id}",
                     use_container_width=True,
                 ):
-                    # переключаем режим и перерисовываем страницу
-                    st.session_state[edit_key] = not is_editing
+                    new_state = not is_editing
+                    st.session_state[edit_key] = new_state
+                    # если мы только что ОТКРЫЛИ редактор — попросим отдать фокус
+                    if new_state:
+                        st.session_state["focus_title_page_id"] = page_id
                     st.rerun()
 
                 edit_mode = st.session_state.get(edit_key, False)
@@ -1755,18 +1931,32 @@ def main():
 
         # col2 - attachment inputs
         with col2:
-            with st.expander("Файлы и ссылки", expanded=False):
+            # ключ управляет сворачиванием/разворачиванием экспандера
+            exp_key = f"attachments_expanded_{page_id}"
+            expanded_state = st.session_state.get(exp_key, False)
+
+            with st.expander("Файлы и ссылки", expanded=expanded_state):
                 if can_edit_notebook:
+                    # счётчик версий для file_uploader, чтобы "очищать" его
+                    ver_key = f"page_attachments_ver_{page_id}"
+                    if ver_key not in st.session_state:
+                        st.session_state[ver_key] = 0
+
+                    upload_key = f"page_attachments_{page_id}_{st.session_state[ver_key]}"
+
                     uploaded_files = st.file_uploader(
                         "Прикрепить файлы к странице",
                         accept_multiple_files=True,
-                        key=f"page_attachments_{page_id}",
+                        key=upload_key,
                     )
-                    if uploaded_files and st.button(
-                        "Сохранить файлы",
+
+                    upload_clicked = st.button(
+                        "Загрузить файлы",
                         key=f"btn_save_attachments_{page_id}",
                         use_container_width=True,
-                    ):
+                    )
+
+                    if upload_clicked and uploaded_files:
                         saved = 0
                         errors: list[str] = []
                         for file in uploaded_files:
@@ -1775,40 +1965,31 @@ def main():
                                 saved += 1
                             except Exception as exc:
                                 errors.append(f"{file.name}: {exc}")
+
                         if saved:
+                            # следующее перерисовывание создаст file_uploader с НОВЫМ ключом,
+                            # поэтому список выбранных файлов будет пустым
+                            st.session_state[ver_key] += 1
+                            # сворачиваем экспандер
+                            st.session_state[exp_key] = False
                             st.success(f"Прикреплено: {saved}")
                             st.rerun()
+
                         if errors:
                             st.warning("; ".join(errors))
-
-                    link_title = st.text_input(
-                        "Подпись для ссылки", key=f"page_link_title_{page_id}"
-                    )
-                    link_url = st.text_input("URL", key=f"page_link_url_{page_id}")
-                    if st.button(
-                        "Сохранить ссылку",
-                        key=f"btn_save_link_{page_id}",
-                        use_container_width=True,
-                    ):
-                        try:
-                            save_link_attachment(page_id, link_url, link_title, selected_login)
-                            st.success("Ссылка сохранена")
-                            st.rerun()
-                        except ValueError as exc:
-                            st.warning(str(exc))
-                        except Exception as exc:
-                            st.error(f"Не удалось сохранить ссылку: {exc}")
                 else:
                     st.caption("Прикреплять файлы могут совладельцы блокнота.")
 
-        # col3 — Expander "Экспорт"
+
+
         with col3:
             with st.expander("Экспорт", expanded=False):
                 safe_title = current_title or f"Страница_{page_id}"
 
+                # DOCX
                 docx_bytes = export_html_to_docx_bytes(current_html, safe_title)
                 st.download_button(
-                    "Экспорт в .docx",
+                    ".docx",
                     data=docx_bytes,
                     file_name=_safe_filename(safe_title, "docx"),
                     mime=(
@@ -1817,13 +1998,43 @@ def main():
                     ),
                 )
 
-                pdf_bytes = export_html_to_pdf_bytes(current_html, safe_title)
+                # # PDF
+                # pdf_bytes = export_html_to_pdf_bytes(current_html, safe_title)
+                # st.download_button(
+                #     "Экспорт в .pdf",
+                #     data=pdf_bytes,
+                #     file_name=_safe_filename(safe_title, "pdf"),
+                #     mime="application/pdf",
+                # )
+
+                # SQL UTF-8 — data формируем прямо в аргументе, НЕ ЧЕРЕЗ промежуточные None-переменные
                 st.download_button(
-                    "Экспорт в .pdf",
-                    data=pdf_bytes,
-                    file_name=_safe_filename(safe_title, "pdf"),
-                    mime="application/pdf",
+                    ".sql (utf-8)",
+                    data=export_html_to_sql_bytes(
+                        current_html or "",
+                        safe_title,
+                        encoding="utf-8",
+                    ),
+                    file_name=_safe_filename(safe_title, "sql"),
+                    mime="text/plain; charset=utf-8",
                 )
+
+                # SQL Windows-1251
+                st.download_button(
+                    ".sql (cp1251)",
+                    data=export_html_to_sql_bytes(
+                        current_html or "",
+                        safe_title,
+                        encoding="cp1251",
+                    ),
+                    file_name=_safe_filename(safe_title, "sql"),
+                    mime="text/plain; charset=windows-1251",
+                )
+
+
+
+
+
 
         # col4 — Expander "Переместить или скопировать"
         with col4:
@@ -1955,13 +2166,15 @@ def main():
 
 
 
-
         # --- Таблица вложений ---
-        st.markdown("### Файлы и ссылки")
+        st.markdown("##### Файлы и ссылки")
         attachments_df = get_page_attachments(page_id)
         if attachments_df.empty:
             st.info("Прикрепленные файлы и ссылки отсутствуют.")
+
         else:
+
+            
             att_display = attachments_df.copy()
             att_display["Размер"] = att_display["file_size"].apply(_format_file_size)
             att_display["Создано"] = (
@@ -1981,8 +2194,66 @@ def main():
                 ["id", "Тип", "Название", "Размер", "Создано", "Автор", "URL"]
             ]
 
+
+
+            # --- СКРЫТЫЕ ССЫЛКИ ДЛЯ ДВОЙНОГО КЛИКА (ФАЙЛЫ) ---
+            links_data = []
+            for row in attachments_df.itertuples(index=False):
+                if row.attachment_type == "file":
+                    payload = get_attachment_file(row.id)
+                    if payload:
+                        file_bytes, file_name, mime_type = payload
+                        b64 = base64.b64encode(file_bytes).decode("ascii")
+                        safe_name = str(file_name)  # имя пойдёт в JS, не в HTML напрямую
+                        href = f"data:{mime_type};base64,{b64}"
+                        links_data.append(
+                            {
+                                "id": int(row.id),
+                                "name": safe_name,
+                                "href": href,
+                            }
+                        )
+
+            if links_data:
+                # создаём скрытые <a> в РОДИТЕЛЬСКОМ документе (Streamlit),
+                # чтобы AgGrid мог по ним кликать через window.parent.document
+                js_payload = json.dumps(links_data, ensure_ascii=False)
+                components.html(
+                    f"""
+                    <script>
+                    (function() {{
+                        var data = {js_payload};
+                        var doc = window.parent.document;
+                        var container = doc.getElementById('attachments_hidden_links');
+                        if (!container) {{
+                            container = doc.createElement('div');
+                            container.id = 'attachments_hidden_links';
+                            container.style.display = 'none';
+                            doc.body.appendChild(container);
+                        }}
+                        data.forEach(function(item) {{
+                            var id = item.id;
+                            var a = doc.getElementById('att_dl_' + id);
+                            if (!a) {{
+                                a = doc.createElement('a');
+                                a.id = 'att_dl_' + id;
+                                a.download = item.name;
+                                a.href = item.href;
+                                container.appendChild(a);
+                            }}
+                        }});
+                    }})();
+                    </script>
+                    """,
+                    height=0,
+                )
+
+
+
+
+
+
             gb_att = GridOptionsBuilder.from_dataframe(grid_df)
-            # ВАЖНО: без чекбоксов — клик по строке сразу выделяет её
             gb_att.configure_selection("single", use_checkbox=False)
             gb_att.configure_column("id", hide=True)
             gb_att.configure_column("URL", hide=True)
@@ -1990,44 +2261,62 @@ def main():
             gb_att.configure_column("Размер", width=90)
             gb_att.configure_column("Тип", width=80)
 
+            # Нативный обработчик двойного клика в JS:
+            # для файла - кликаем по скрытой ссылке,
+            # для ссылки - просто открываем URL в новой вкладке.
+            row_doubleclick_js = JsCode(
+                """
+                function (e) {
+                    var d = e.data || {};
+                    var id = d.id;
+                    var type = d["Тип"];
+                    var url = d["URL"] || "";
+
+                    if (!id) { return; }
+
+                    if (type === "Файл") {
+                        // ссылки лежат в родительском документе
+                        var a = window.parent.document.getElementById("att_dl_" + id);
+                        if (a) {
+                            a.click();
+                        }
+                    } else if (type === "Ссылка" && url) {
+                        window.parent.open(url, "_blank");
+                    }
+                }
+                """
+            )
+            gb_att.configure_grid_options(onRowDoubleClicked=row_doubleclick_js)
+
             grid_response = AgGrid(
                 grid_df,
                 gridOptions=gb_att.build(),
                 enable_enterprise_modules=False,
-                # как и в списке страниц — реагируем на изменение выделения
-                update_on=["selectionChanged"],
+                update_on=["selectionChanged"],  # rowDoubleClicked БОЛЬШЕ НЕ НУЖЕН
                 height=220,
                 fit_columns_on_grid_load=True,
+                allow_unsafe_jscode=True,
             )
 
+
+
+
+
+            # обычный выбор строки – для кнопок Скачать/Удалить
             selected_rows = grid_response.get("selected_rows", [])
             if isinstance(selected_rows, pd.DataFrame):
                 selected_rows = selected_rows.to_dict("records")
-
             selected_att = selected_rows[0] if selected_rows else None
 
-            # --- эмуляция двойного клика через время между кликами ---
-            double_clicked = False
-            if selected_att:
-                now = datetime.now()
-                click_state_key = f"att_last_click_{page_id}"
-                last = st.session_state.get(click_state_key)
-                att_id = int(selected_att["id"])
-                if last and last.get("id") == att_id:
-                    last_ts = last.get("ts")
-                    if isinstance(last_ts, datetime):
-                        if (now - last_ts).total_seconds() <= 0.8:
-                            double_clicked = True
-                st.session_state[click_state_key] = {"id": att_id, "ts": now}
 
+
+
+
+            # --- КНОПКИ СКАЧАТЬ / ОТКРЫТЬ + УДАЛИТЬ ДЛЯ ВЫДЕЛЕННОЙ СТРОКИ ---
             if selected_att:
                 att_id = int(selected_att["id"])
                 att_type = selected_att.get("Тип")
                 url_val = selected_att.get("URL") or ""
-
-
-
-
 
                 if att_type == "Файл":
                     payload = get_attachment_file(att_id)
@@ -2036,8 +2325,7 @@ def main():
                     else:
                         file_bytes, file_name, mime_type = payload
 
-                        # узкая колонка под кнопку
-                        btn_col, _ = st.columns([1, 4])
+                        btn_col, del_col, _ = st.columns([1, 1, 3])
                         with btn_col:
                             st.download_button(
                                 "Скачать файл",
@@ -2047,82 +2335,86 @@ def main():
                                 key=f"download_selected_attachment_{att_id}",
                                 use_container_width=True,
                             )
-
-                        # авто-скачивание по двойному клику
-                        if double_clicked:
-                            encoded = base64.b64encode(file_bytes).decode("ascii")
-                            components.html(
-                                f"""
-                                <a id="auto_download_{att_id}" download="{file_name}"
-                                href="data:{mime_type};base64,{encoded}"></a>
-                                <script>
-                                const a = document.getElementById("auto_download_{att_id}");
-                                if (a) {{ a.click(); }}
-                                </script>
-                                """,
-                                height=0,
-                            )
+                        if can_edit_notebook:
+                            with del_col:
+                                if st.button(
+                                    "Удалить вложение",
+                                    key=f"delete_attachment_{att_id}",
+                                    use_container_width=True,
+                                ):
+                                    delete_attachment(att_id)
+                                    st.success("Вложение удалено")
+                                    st.rerun()
 
                 elif att_type == "Ссылка":
                     if not url_val:
                         st.warning("Ссылка не указана.")
                     else:
-                        btn_col, _ = st.columns([1, 4])
+                        btn_col, del_col, _ = st.columns([1, 1, 3])
                         with btn_col:
                             st.markdown(f"[Открыть ссылку]({url_val})")
+                        if can_edit_notebook:
+                            with del_col:
+                                if st.button(
+                                    "Удалить",
+                                    key=f"delete_link_{att_id}",
+                                    use_container_width=True,
+                                ):
+                                    delete_attachment(att_id)
+                                    st.success("Вложение удалено")
+                                    st.rerun()
 
-                        # авто-открытие по двойному клику
-                        if double_clicked:
-                            components.html(
-                                f"""
-                                <script>
-                                window.open("{url_val}", "_blank");
-                                </script>
-                                """,
-                                height=0,
-                            )
 
 
 
 
         if can_edit_notebook and edit_mode:
-            st.markdown("### Редактирование")
+            st.markdown("##### Редактирование")
 
-            title_key = f"title_{page_id}"
-            new_title = st.text_input(
-                "Название страницы",
-                value=current_title,
-                key=title_key,
-            )
+            col1_edit, col2_edit = st.columns([2, 2])
 
-            if forced_edit_page_id == page_id:
+            # --------- левая колонка: Название страницы ----------
+            with col1_edit:
+                title_key = f"title_{page_id}"
+                new_title = st.text_input(
+                    "Название страницы",
+                    value=current_title,
+                    key=title_key,
+                )
+
+            # фокус на поле названия, если нужно
+            focus_page_id = st.session_state.pop("focus_title_page_id", None)
+            if focus_page_id == page_id:
                 components.html(
                     """
                     <script>
                     setTimeout(function () {
-                      const doc = window.parent.document;
-                      const labels = Array.from(doc.querySelectorAll('label'));
-                      const label = labels.find(
+                    const doc = window.parent.document;
+                    const labels = Array.from(doc.querySelectorAll('label'));
+                    const label = labels.find(
                         l => l.textContent.trim() === 'Название страницы'
-                      );
-                      if (label) {
+                    );
+                    if (label) {
                         const input = label.parentElement.querySelector('input');
                         if (input) {
-                          input.focus();
-                          input.select();
+                        input.focus();
+                        input.select();
                         }
-                      }
+                    }
                     }, 50);
                     </script>
                     """,
                     height=0,
                 )
 
-            new_tag = st.text_input(
-                "Тег",
-                value=current_page.get("tag") or "",
-                key=f"tag_{page_id}",
-            )
+            # --------- правая колонка: Тег ----------
+            with col2_edit:
+                new_tag = st.text_input(
+                    "Тег",
+                    value=current_page.get("tag") or "",
+                    key=f"tag_{page_id}",
+                )
+
             editable_html = strip_data_uri_images(current_html)
             quill_html = (
                 st_quill(
@@ -2138,10 +2430,11 @@ def main():
                 "Подтвердить удаление",
                 key=f"confirm_delete_{page_id}",
             )
-            cols = st.columns([2, 1])
+            cols = st.columns([1, 3])
             if cols[0].button("Сохранить изменения", key=f"save_{page_id}"):
                 update_page(page_id, new_title, quill_html, new_tag)
                 st.success("Страница обновлена")
+                st.session_state[edit_key] = False   # закрываем редактор
                 st.rerun()
             if cols[1].button(
                 "Удалить страницу", key=f"delete_{page_id}", type="secondary"
@@ -2152,6 +2445,9 @@ def main():
                     st.rerun()
                 else:
                     st.warning("Поставьте галочку для подтверждения.")
+
+
+
 
         elif not can_edit_notebook:
             st.info("У вас права только на просмотр этой записной книжки.")
