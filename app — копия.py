@@ -1868,41 +1868,24 @@ def main():
 
         preview_html = f"""
         <style>
-        /* контейнер страницы */
-        .page-preview-wrapper {{
-            border: 1px solid #d0d4da;
-            border-radius: 6px;
-            padding: 16px 18px;
-            background-color: #ffffff;
-            box-shadow: 0 1px 2px rgba(0,0,0,0.04);
-            min-height: 500px;
-            box-sizing: border-box;
-        }}
-
-        /* стили текста внутри */
         .preview-body *,
         .preview-body p,
         .preview-body li {{
             line-height: 1.15 !important;
         }}
-
         .preview-body p {{
             margin: 0.2em 0 !important;
         }}
         </style>
-
-        <div class="page-preview-wrapper">
-            <div class="preview-body">
-                {current_html or "<p><em>Нет содержимого</em></p>"}
-            </div>
+        <div class="preview-body">
+            {current_html or "<p><em>Нет содержимого</em></p>"}
         </div>
         """
         components.html(
             preview_html,
-            height=560,
+            height=520,
             scrolling=True,
         )
-
 
 
 
@@ -2250,9 +2233,11 @@ def main():
         # st.markdown("##### Файлы и ссылки")
         attachments_df = get_page_attachments(page_id)
         if attachments_df.empty:
-            # st.info("Прикрепленные файлы и ссылки отсутствуют.")
-            pass
+            st.info("Прикрепленные файлы и ссылки отсутствуют.")
+
         else:
+
+            
             att_display = attachments_df.copy()
             att_display["Размер"] = att_display["file_size"].apply(_format_file_size)
             att_display["Создано"] = (

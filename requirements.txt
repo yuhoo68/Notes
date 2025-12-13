@@ -1,7 +1,7 @@
 pandas>=2.3
 streamlit=1.48.1
 streamlit-aggrid>=1.2
-streamlit-quill>=0.0.3
+streamlit-quill=0.0.3
 beautifulsoup4>=4.12
 jaydebeapi>=1.2
 requests>=2.31
