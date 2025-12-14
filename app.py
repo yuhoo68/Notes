@@ -2082,8 +2082,6 @@ def main():
                 )
 
 
-
-
         # col3 - attachment inputs
         with col3:
             # ключ управляет сворачиванием/разворачиванием экспандера
@@ -2091,27 +2089,18 @@ def main():
             expanded_state = st.session_state.get(exp_key, False)
 
             with st.expander("Файлы и ссылки", expanded=expanded_state):
+
                 if can_edit_notebook:
-                    # счётчик версий для file_uploader, чтобы "очищать" его
-                    ver_key = f"page_attachments_ver_{page_id}"
-                    if ver_key not in st.session_state:
-                        st.session_state[ver_key] = 0
-
-                    upload_key = f"page_attachments_{page_id}_{st.session_state[ver_key]}"
-
                     uploaded_files = st.file_uploader(
                         "Прикрепить файлы к странице",
                         accept_multiple_files=True,
-                        key=upload_key,
+                        key=f"page_attachments_{page_id}",
                     )
-
-                    upload_clicked = st.button(
-                        "Загрузить файлы",
+                    if uploaded_files and st.button(
+                        "Сохранить файлы",
                         key=f"btn_save_attachments_{page_id}",
                         use_container_width=True,
-                    )
-
-                    if upload_clicked and uploaded_files:
+                    ):
                         saved = 0
                         errors: list[str] = []
                         for file in uploaded_files:
@@ -2120,22 +2109,31 @@ def main():
                                 saved += 1
                             except Exception as exc:
                                 errors.append(f"{file.name}: {exc}")
-
                         if saved:
-                            # следующее перерисовывание создаст file_uploader с НОВЫМ ключом,
-                            # поэтому список выбранных файлов будет пустым
-                            st.session_state[ver_key] += 1
-                            # сворачиваем экспандер
-                            st.session_state[exp_key] = False
                             st.success(f"Прикреплено: {saved}")
                             st.rerun()
-
                         if errors:
                             st.warning("; ".join(errors))
+
+                    link_title = st.text_input(
+                        "Подпись для ссылки", key=f"page_link_title_{page_id}"
+                    )
+                    link_url = st.text_input("URL", key=f"page_link_url_{page_id}")
+                    if st.button(
+                        "Сохранить ссылку",
+                        key=f"btn_save_link_{page_id}",
+                        use_container_width=True,
+                    ):
+                        try:
+                            save_link_attachment(page_id, link_url, link_title, selected_login)
+                            st.success("Ссылка сохранена")
+                            st.rerun()
+                        except ValueError as exc:
+                            st.warning(str(exc))
+                        except Exception as exc:
+                            st.error(f"Не удалось сохранить ссылку: {exc}")
                 else:
                     st.caption("Прикреплять файлы могут совладельцы блокнота.")
-
-
 
 
         # col4 — Expander "Переместить или скопировать"
