@@ -1166,13 +1166,15 @@ def main():
     st.markdown(
         """
         <style>
+        /* задаём стартовую/минимальную ширину, но не фиксируем её */
         [data-testid="stSidebar"] {
-            width: 330px;         /* начальная ширина */
+            min-width: 330px;
         }
         </style>
         """,
         unsafe_allow_html=True,
-    )
+)
+
 
     ensure_db_credentials()
 
@@ -1235,6 +1237,8 @@ def main():
                     (r for r in dept_records if r.department_id == user_dep_id),
                     None,
                 )
+            else:
+                is_user_department_selected = False
 
             # если пользователя нет в notes_users или dep_id не найден —
             # берём строку с department_id == "00" (Все),
@@ -1254,6 +1258,13 @@ def main():
             key="department_selector",
         )
         selected_department_id = selected_department.department_id
+
+        # подразделение пользователя (из notes_users)
+        user_dep_id = user_dept_map.get(selected_login)
+
+        # ✅ выбран ли сейчас отдел пользователя
+        is_user_department_selected = bool(user_dep_id) and (str(selected_department_id) == str(user_dep_id))
+
 
     st.session_state["current_department_id"] = selected_department_id
 
@@ -1289,7 +1300,7 @@ def main():
     welcome_name = _name_patronymic(user_map.get(selected_login), selected_login)
 
     # подразделение пользователя
-    user_dep_id = user_dept_map.get(selected_login)
+    #user_dep_id = user_dept_map.get(selected_login)
     user_dep_name = department_map.get(user_dep_id, "") if user_dep_id else ""
 
     dep_prefix = f"[{user_dep_name}] " if user_dep_name else ""
@@ -1371,6 +1382,11 @@ def main():
                         st.session_state["notebook_selector"] = target_row
 
                 def _nb_label(row):
+                    # ✅ Если выбран отдел текущего пользователя — показываем только название книги
+                    if is_user_department_selected:
+                        return f"{row.name}"
+
+                    # иначе показываем как сейчас: название + подразделение + видимость
                     dept_id = getattr(row, "department_id", None)
                     dept_name = department_map.get(dept_id, "") if dept_id else ""
                     dept_txt = f" [{dept_name}]" if dept_name else ""
@@ -1384,6 +1400,7 @@ def main():
                         closed_txt = " (только владельцы)"
 
                     return f"{row.name}{dept_txt}{closed_txt}"
+
                 
                 st.markdown("###### ")
                 st.markdown("###### Записная книга")
@@ -1802,7 +1819,7 @@ def main():
 
     gb = GridOptionsBuilder.from_dataframe(df_display)
     gb.configure_selection("single", use_checkbox=False)
-    gb.configure_column("title", header_name="Страница", width=220)
+    gb.configure_column("title", header_name="Страница", flex=1, minWidth=160)
     gb.configure_column("id", header_name="ID", width=60, hide=True)
 
     force_page_id = st.session_state.pop("force_page_id", None)
@@ -1815,6 +1832,14 @@ def main():
             pass
 
     list_container = st.sidebar.container()
+
+    on_grid_ready = JsCode("function(params) { params.api.sizeColumnsToFit(); }")
+    on_grid_size_changed = JsCode("function(params) { params.api.sizeColumnsToFit(); }")
+    gb.configure_grid_options(
+        onGridReady=on_grid_ready,
+        onGridSizeChanged=on_grid_size_changed,
+    )
+
     with list_container:
         grid_response = AgGrid(
             df_display,
@@ -1822,8 +1847,10 @@ def main():
             enable_enterprise_modules=False,
             update_on=["selectionChanged"],
             height=650,
-            fit_columns_on_grid_load=True,
+            fit_columns_on_grid_load=False,   # можно оставить False, т.к. делаем сами
+            allow_unsafe_jscode=True,         # ✅ важно
         )
+
 
     selected_rows = grid_response.get("selected_rows", [])
     if isinstance(selected_rows, pd.DataFrame):
@@ -1859,8 +1886,8 @@ def main():
         dept_prefix = f"[{dept_name_for_page}] " if dept_name_for_page else ""
 
         st.caption(
-            f"{dept_prefix}{current_page['notebook_name']} - "
-            f"{current_page['section_name']} - {current_page['title']}"
+            f"{dept_prefix}  {current_page['notebook_name']}  =>  "
+            f"{current_page['section_name']}  =>  {current_page['title']}"
         )
 
         if current_tag:
@@ -1875,7 +1902,7 @@ def main():
             padding: 16px 18px;
             background-color: #ffffff;
             box-shadow: 0 1px 2px rgba(0,0,0,0.04);
-            min-height: 500px;
+            min-height: 580px;
             box-sizing: border-box;
         }}
 
@@ -1899,7 +1926,7 @@ def main():
         """
         components.html(
             preview_html,
-            height=560,
+            height=600,
             scrolling=True,
         )
 
@@ -1990,7 +2017,7 @@ def main():
 
 
         # --- кнопка редактирования + экспорт + перемещение/копирование ---
-        col1, col2, col3, col4 = st.columns([1.3, 2.4, 1.2, 3])
+        col1, col2, col3, col4 = st.columns([1.5, 1.5, 3, 3])
 
         with col1:
             if can_edit_notebook:
@@ -2005,64 +2032,7 @@ def main():
                 st.caption("Просмотр (редактирование недоступно)")
 
 
-
-
-
-
-        # col2 - attachment inputs
         with col2:
-            # ключ управляет сворачиванием/разворачиванием экспандера
-            exp_key = f"attachments_expanded_{page_id}"
-            expanded_state = st.session_state.get(exp_key, False)
-
-            with st.expander("Файлы и ссылки", expanded=expanded_state):
-                if can_edit_notebook:
-                    # счётчик версий для file_uploader, чтобы "очищать" его
-                    ver_key = f"page_attachments_ver_{page_id}"
-                    if ver_key not in st.session_state:
-                        st.session_state[ver_key] = 0
-
-                    upload_key = f"page_attachments_{page_id}_{st.session_state[ver_key]}"
-
-                    uploaded_files = st.file_uploader(
-                        "Прикрепить файлы к странице",
-                        accept_multiple_files=True,
-                        key=upload_key,
-                    )
-
-                    upload_clicked = st.button(
-                        "Загрузить файлы",
-                        key=f"btn_save_attachments_{page_id}",
-                        use_container_width=True,
-                    )
-
-                    if upload_clicked and uploaded_files:
-                        saved = 0
-                        errors: list[str] = []
-                        for file in uploaded_files:
-                            try:
-                                save_file_attachment(page_id, file, selected_login)
-                                saved += 1
-                            except Exception as exc:
-                                errors.append(f"{file.name}: {exc}")
-
-                        if saved:
-                            # следующее перерисовывание создаст file_uploader с НОВЫМ ключом,
-                            # поэтому список выбранных файлов будет пустым
-                            st.session_state[ver_key] += 1
-                            # сворачиваем экспандер
-                            st.session_state[exp_key] = False
-                            st.success(f"Прикреплено: {saved}")
-                            st.rerun()
-
-                        if errors:
-                            st.warning("; ".join(errors))
-                else:
-                    st.caption("Прикреплять файлы могут совладельцы блокнота.")
-
-
-
-        with col3:
             with st.expander("Экспорт", expanded=False):
                 safe_title = current_title or f"Страница_{page_id}"
 
@@ -2112,6 +2082,58 @@ def main():
                 )
 
 
+
+
+        # col3 - attachment inputs
+        with col3:
+            # ключ управляет сворачиванием/разворачиванием экспандера
+            exp_key = f"attachments_expanded_{page_id}"
+            expanded_state = st.session_state.get(exp_key, False)
+
+            with st.expander("Файлы и ссылки", expanded=expanded_state):
+                if can_edit_notebook:
+                    # счётчик версий для file_uploader, чтобы "очищать" его
+                    ver_key = f"page_attachments_ver_{page_id}"
+                    if ver_key not in st.session_state:
+                        st.session_state[ver_key] = 0
+
+                    upload_key = f"page_attachments_{page_id}_{st.session_state[ver_key]}"
+
+                    uploaded_files = st.file_uploader(
+                        "Прикрепить файлы к странице",
+                        accept_multiple_files=True,
+                        key=upload_key,
+                    )
+
+                    upload_clicked = st.button(
+                        "Загрузить файлы",
+                        key=f"btn_save_attachments_{page_id}",
+                        use_container_width=True,
+                    )
+
+                    if upload_clicked and uploaded_files:
+                        saved = 0
+                        errors: list[str] = []
+                        for file in uploaded_files:
+                            try:
+                                save_file_attachment(page_id, file, selected_login)
+                                saved += 1
+                            except Exception as exc:
+                                errors.append(f"{file.name}: {exc}")
+
+                        if saved:
+                            # следующее перерисовывание создаст file_uploader с НОВЫМ ключом,
+                            # поэтому список выбранных файлов будет пустым
+                            st.session_state[ver_key] += 1
+                            # сворачиваем экспандер
+                            st.session_state[exp_key] = False
+                            st.success(f"Прикреплено: {saved}")
+                            st.rerun()
+
+                        if errors:
+                            st.warning("; ".join(errors))
+                else:
+                    st.caption("Прикреплять файлы могут совладельцы блокнота.")
 
 
 
@@ -2457,7 +2479,7 @@ def main():
 
         # ✅ Удаление страницы — НА ОСНОВНОЙ ФОРМЕ (под вложениями)
         if can_edit_notebook:
-            st.markdown("###### Удаление страницы")
+            #st.markdown("###### Удаление страницы")
 
             # --- проверяем наличие вложений ---
             attachments_df_for_delete = get_page_attachments(page_id)
@@ -2468,7 +2490,7 @@ def main():
                     "Удаление страницы запрещено: сначала удалите все прикреплённые файлы и ссылки."
                 )
 
-            col1, col2, col3 = st.columns([2, 2, 6])
+            col1, col2, col3, col4 = st.columns([1.5, 1.5, 3,3])
 
             with col1:
                 confirm_delete = st.checkbox(
