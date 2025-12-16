@@ -289,31 +289,6 @@ def get_notebooks(user_login: str, user_department_id: str | None) -> pd.DataFra
     )
 
 
-    return run_fetch_df(
-        f"""
-        SELECT n.id,
-               n.name,
-               n.department_id,
-               n.created_at,
-               n.updated_at,
-               n.created_by
-        FROM {NOTEBOOKS_TABLE} n
-        WHERE
-            (
-                -- 99: только создатель
-                (n.department_id = '99' AND n.created_by = '{ulogin}')
-            )
-            OR
-            (
-                -- НЕ 99: обычные правила + owners
-                (n.department_id IS NULL OR n.department_id <> '99')
-                AND ({owner_condition} OR {dept_visibility_non99})
-            )
-        ORDER BY n.name
-        """
-    )
-
-
 def get_owned_notebooks(user_login: str) -> pd.DataFrame:
     """Книги, в которых пользователь является владельцем (для назначения при копировании/перемещении)."""
     return run_fetch_df(
@@ -996,7 +971,7 @@ def main():
     )
 
     ensure_db_credentials()
-    owned_notebooks_df = pd.DataFrame()   
+    owned_notebooks_df = pd.DataFrame()
 
     users_df = list_users()
     user_records = list(users_df.itertuples(index=False))
@@ -1018,7 +993,6 @@ def main():
 
     owned_notebooks_df = get_owned_notebooks(selected_login)
 
-
     departments_df = get_departments()
     department_map = {
         row.department_id: row.name_department
@@ -1033,7 +1007,7 @@ def main():
     dept_records = list(departments_df.itertuples(index=False)) if not departments_df.empty else []
 
     is_user_department_selected = False
-    
+
     forced_department_id = st.session_state.pop("force_department_id", None)
 
     if dept_records:
@@ -1051,7 +1025,6 @@ def main():
         #    - иначе 00 (Все)
         if "department_selector" not in st.session_state and not forced_department_id:
             has_owned_books = not owned_notebooks_df.empty
-
             default_dep_id = "99" if has_owned_books else "00"
 
             default_row = next(
@@ -1080,8 +1053,6 @@ def main():
     else:
         selected_department_id = "00"
         is_user_department_selected = False
-
-
 
     st.session_state["current_department_id"] = selected_department_id
 
@@ -1116,25 +1087,26 @@ def main():
     if current_department_id != "00" and not filtered_notebooks_df.empty:
         dep_col = filtered_notebooks_df["department_id"].fillna("00").astype(str)
 
-        # 99 = (Владельцы): показываем только книги owners-only, где пользователь владелец
+        # ✅ 99 = (Владельцы): показываем ВСЕ книги, где текущий пользователь владелец,
+        # независимо от department_id книги
         if str(current_department_id) == "99":
             owned_ids = (
                 set(owned_notebooks_df["id"].astype(int).tolist())
                 if not owned_notebooks_df.empty
                 else set()
             )
-            mask = (dep_col == "99") & (filtered_notebooks_df["id"].astype(int).isin(owned_ids))
-            filtered_notebooks_df = filtered_notebooks_df[mask]
+            filtered_notebooks_df = filtered_notebooks_df[
+                filtered_notebooks_df["id"].astype(int).isin(owned_ids)
+            ]
         else:
             prefix = str(current_department_id).strip()
-            prefix_like = prefix + "." if "." not in prefix else prefix + "."
+            prefix_like = prefix + "."
             mask = (
-                (dep_col == "00")                   # "Все" остаётся видимым
-                | (dep_col == prefix)               # точное совпадение
+                (dep_col == "00")                  # "Все" остаётся видимым
+                | (dep_col == prefix)              # точное совпадение
                 | dep_col.str.startswith(prefix_like)  # подчинённые
             )
             filtered_notebooks_df = filtered_notebooks_df[mask]
-
 
     selected_notebook_id: int | None = None
     selected_section_id: int | None = None
@@ -1335,12 +1307,11 @@ def main():
 
     # --- список разделов ---
     sections_df = pd.DataFrame()
-    section_records: list = []   # ✅ ИНИЦИАЛИЗАЦИЯ
+    section_records: list = []
 
     if selected_notebook_id is not None:
         sections_df = get_sections(selected_notebook_id)
         section_records = list(sections_df.itertuples(index=False))
-
 
     with top_col3:
         select_col2, plus_col2, manage_col2 = st.columns([14, 2, 2])
