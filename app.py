@@ -996,6 +996,7 @@ def main():
     )
 
     ensure_db_credentials()
+    owned_notebooks_df = pd.DataFrame()   
 
     users_df = list_users()
     user_records = list(users_df.itertuples(index=False))
@@ -1015,6 +1016,9 @@ def main():
         st.sidebar.info("Нет доступных пользователей.")
         return
 
+    owned_notebooks_df = get_owned_notebooks(selected_login)
+
+
     departments_df = get_departments()
     department_map = {
         row.department_id: row.name_department
@@ -1027,32 +1031,57 @@ def main():
     # --- Левый сайдбар: выбор подразделения (включая 99) ---
     selected_department_id = "00"
     dept_records = list(departments_df.itertuples(index=False)) if not departments_df.empty else []
-    forced_department_id = st.session_state.pop("force_department_id", None)
 
     is_user_department_selected = False
+    
+    forced_department_id = st.session_state.pop("force_department_id", None)
 
     if dept_records:
+        # 1) если только что создавали книгу – форсим подразделение книги
         if forced_department_id:
-            forced_row = next((r for r in dept_records if r.department_id == forced_department_id), None)
+            forced_row = next(
+                (r for r in dept_records if str(r.department_id) == str(forced_department_id)),
+                None,
+            )
             if forced_row is not None:
                 st.session_state["department_selector"] = forced_row
 
+        # 2) если selector ещё не задан — ставим дефолт:
+        #    - 99 (Владельцы), если у пользователя есть свои книги (owners)
+        #    - иначе 00 (Все)
         if "department_selector" not in st.session_state and not forced_department_id:
-            default_row = None
-            if user_dep_id:
-                default_row = next((r for r in dept_records if r.department_id == user_dep_id), None)
+            has_owned_books = not owned_notebooks_df.empty
+
+            default_dep_id = "99" if has_owned_books else "00"
+
+            default_row = next(
+                (r for r in dept_records if str(r.department_id) == default_dep_id),
+                None,
+            )
             if default_row is None:
-                default_row = next((r for r in dept_records if str(r.department_id) == "00"), dept_records[0])
+                # fallback на первый элемент, если вдруг справочник не содержит 99/00
+                default_row = dept_records[0]
+
             st.session_state["department_selector"] = default_row
 
         selected_department = st.sidebar.selectbox(
             "Подразделение",
             dept_records,
-            format_func=lambda row: row.name_department,  # ✅ только name_department (в т.ч. для 99)
+            format_func=lambda row: row.name_department,
             key="department_selector",
         )
         selected_department_id = str(selected_department.department_id)
+
+        # подразделение пользователя (из notes_users)
+        user_dep_id = user_dept_map.get(selected_login)
+
+        # выбран ли сейчас отдел пользователя
         is_user_department_selected = bool(user_dep_id) and (str(selected_department_id) == str(user_dep_id))
+    else:
+        selected_department_id = "00"
+        is_user_department_selected = False
+
+
 
     st.session_state["current_department_id"] = selected_department_id
 
@@ -1079,7 +1108,6 @@ def main():
 
     # --- список книг пользователя (по новой ролевой модели + 99) ---
     notebooks_df = get_notebooks(selected_login, user_dep_id)
-    owned_notebooks_df = get_owned_notebooks(selected_login)
 
     filtered_notebooks_df = notebooks_df.copy()
     current_department_id: str = st.session_state.get("current_department_id", "00")
