@@ -99,6 +99,9 @@ def ensure_db_credentials() -> dict[str, str]:
 
 
 st.session_state.setdefault("edit_dialog_page_id", None)
+st.session_state.setdefault("download_payload", None)      # tuple[bytes, str, str] | None
+st.session_state.setdefault("download_att_id", None)       # int | None
+st.session_state.setdefault("download_error", None)        # str | None
 
 
 def _creds() -> tuple[str, str]:
@@ -108,11 +111,7 @@ def _creds() -> tuple[str, str]:
 
 def run_fetch_df(query: str) -> pd.DataFrame:
     user, pwd = _creds()
-    result = get_fetch(query, user, pwd)
-    if not result:
-        return pd.DataFrame()
-    rows, columns = result
-    return pd.DataFrame(rows, columns=columns)
+    return get_fetch(query, user, pwd)
 
 
 def run_execute(query: str) -> int | None:
@@ -158,10 +157,11 @@ def create_user(login: str, full_name: str) -> str:
         f"""
         INSERT INTO {USERS_TABLE} (login, full_name)
         VALUES ('{_escape(normalized)}', '{_escape(name)}')
-        ON CONFLICT (login) DO NOTHING
         """
     )
     return normalized
+
+#         ON CONFLICT (login) DO NOTHING
 
 
 def add_notebook_owner(notebook_id: int, user_login: str) -> None:
@@ -170,7 +170,6 @@ def add_notebook_owner(notebook_id: int, user_login: str) -> None:
         f"""
         INSERT INTO {OWNERS_TABLE} (notebook_id, user_login)
         VALUES ({int(notebook_id)}, '{_escape(user_login)}')
-        ON CONFLICT DO NOTHING
         """
     )
 
@@ -1878,47 +1877,61 @@ def main():
                 selected_rows = selected_rows.to_dict("records")
             selected_att = selected_rows[0] if selected_rows else None
 
+
+
+
             if selected_att:
                 att_id = int(selected_att["id"])
                 att_type = selected_att.get("Тип")
                 url_val = selected_att.get("URL") or ""
 
+                # --- Файл ---
                 if att_type == "Файл":
-                    payload = get_attachment_file(att_id)
-                    if payload is None:
-                        st.warning("Файл недоступен.")
-                    else:
-                        file_bytes, file_name, mime_type = payload
-                        btn_col, del_col, _ = st.columns([1, 1, 3])
-                        with btn_col:
-                            st.download_button(
-                                "Скачать файл",
-                                data=file_bytes,
-                                file_name=file_name,
-                                mime=mime_type or "application/octet-stream",
-                                key=f"download_selected_attachment_{att_id}",
-                                use_container_width=True,
-                            )
-                        if can_edit_notebook:
-                            with del_col:
-                                if st.button("Удалить вложение", key=f"delete_attachment_{att_id}", use_container_width=True):
-                                    delete_attachment(att_id)
-                                    st.success("Вложение удалено")
-                                    st.rerun()
+                    # Метаданные берём из таблицы (без загрузки файла)
+                    row_meta = attachments_df[attachments_df["id"].astype(int) == int(att_id)]
+                    file_name_meta = ""
+                    mime_meta = "application/octet-stream"
+                    file_size_meta = None
 
+                    if not row_meta.empty:
+                        file_name_meta = str(row_meta.iloc[0].get("file_name") or "")
+                        mime_meta = str(row_meta.iloc[0].get("mime_type") or "application/octet-stream")
+                        file_size_meta = row_meta.iloc[0].get("file_size")
+
+                    del_col, _ = st.columns([1,  4])
+
+
+
+                    # Удаление (как было)
+                    if can_edit_notebook:
+                        with del_col:
+                            if st.button("Удалить вложение", key=f"delete_attachment_{att_id}", use_container_width=True):
+                                delete_attachment(att_id)
+                                # очистим кэш скачивания, если удалили то же вложение
+                                if st.session_state.get("download_att_id") == att_id:
+                                    st.session_state["download_att_id"] = None
+                                    st.session_state["download_payload"] = None
+                                    st.session_state["download_error"] = None
+                                st.success("Вложение удалено")
+                                st.rerun()
+
+                # --- Ссылка (без изменений) ---
                 elif att_type == "Ссылка":
                     if not url_val:
                         st.warning("Ссылка не указана.")
                     else:
-                        btn_col, del_col, _ = st.columns([1, 1, 3])
-                        with btn_col:
-                            st.markdown(f"[Открыть ссылку]({url_val})")
+                        del_col, _ = st.columns([1, 4])
                         if can_edit_notebook:
                             with del_col:
-                                if st.button("Удалить", key=f"delete_link_{att_id}", use_container_width=True):
+                                if st.button("Удалить ссылку", key=f"delete_link_{att_id}", use_container_width=True):
                                     delete_attachment(att_id)
-                                    st.success("Вложение удалено")
+                                    st.success("Ссылка удалена")
                                     st.rerun()
+
+
+
+
+
 
         # --- Удаление страницы (с проверкой вложений) ---
         if can_edit_notebook:

@@ -1,20 +1,10 @@
-"""
-Utility helpers for executing SQL against PostgreSQL over JDBC.
-
-Connection details come from config.py. The helpers accept a raw SQL string
-and database credentials that should be supplied at runtime (e.g., from
-Streamlit session state).
-"""
-
 from __future__ import annotations
-
 import os
 from typing import Any, Iterable
-
 import jaydebeapi
-
 import config
-
+import pandas as pd
+from typing import Any
 
 def _shorten_for_log(query: str, limit: int = 150) -> str:
     """Return a truncated version of the query for logging."""
@@ -50,11 +40,16 @@ def _connect_postgres(user: str, password: str) -> jaydebeapi.Connection | None:
         return None
 
 
-def get_fetch(query: str, user_name: str, user_passw: str) -> tuple[list[tuple[Any, ...]], list[str]] | None:
-    """
-    Execute a SELECT (or any read) query and return fetched rows with column names.
 
-    Parameters mirror the legacy helper but use PostgreSQL JDBC connection details from config.py.
+def get_fetch(
+    query: str,
+    user_name: str,
+    user_passw: str
+) -> pd.DataFrame | None:
+    """
+    Execute a SELECT (or any read) query and return result as a pandas DataFrame.
+
+    Uses PostgreSQL JDBC connection details from config.py.
     """
     conn = _connect_postgres(user_name, user_passw)
     if conn is None:
@@ -64,18 +59,24 @@ def get_fetch(query: str, user_name: str, user_passw: str) -> tuple[list[tuple[A
         with conn:
             with conn.cursor() as cursor:
                 cursor.execute(query)
-                result = cursor.fetchall()
+                rows = cursor.fetchall()
                 columns = [col[0] for col in (cursor.description or [])]
+
+                df = pd.DataFrame(rows, columns=columns)
+
                 print("Успешно выполнено:", _shorten_for_log(query))
-                return list(result), columns
+                return df
+
     except Exception as exc:
         print("Ошибка при выполнении запроса:", exc)
         return None
+
     finally:
         try:
             conn.close()
         except Exception:
             pass
+
 
 
 def get_execute(query: str, user_name: str, user_passw: str) -> int | None:
