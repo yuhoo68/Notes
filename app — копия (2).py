@@ -32,6 +32,17 @@ DEPARTMENTS_TABLE = f"{SCHEMA}.notes_departments"
 ATTACHMENTS_TABLE = f"{SCHEMA}.notes_page_attachments"
 
 
+# =========================
+# НАСТРОЙКИ ВЫСОТЫ QUILL
+# =========================
+# ✅ Единственный параметр, которым ты регулируешь высоту окна редактора (в px).
+# Рекомендация для 1920x1080: 520..700
+QUILL_IFRAME_HEIGHT_PX = 620
+
+# (опционально) высота самого диалога (если захочешь ограничивать по vh)
+EDIT_DIALOG_HEIGHT_VH = 92
+
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -999,7 +1010,6 @@ def main():
     forced_department_id = st.session_state.pop("force_department_id", None)
 
     if dept_records:
-        # 1) если только что создавали книгу – форсим подразделение книги
         if forced_department_id:
             forced_row = next(
                 (r for r in dept_records if str(r.department_id) == str(forced_department_id)),
@@ -1008,9 +1018,6 @@ def main():
             if forced_row is not None:
                 st.session_state["department_selector"] = forced_row
 
-        # 2) если selector ещё не задан — ставим дефолт:
-        #    - 99 (Владельцы), если у пользователя есть свои книги (owners)
-        #    - иначе 00 (Все)
         if "department_selector" not in st.session_state and not forced_department_id:
             has_owned_books = not owned_notebooks_df.empty
             default_dep_id = "99" if has_owned_books else "00"
@@ -1020,7 +1027,6 @@ def main():
                 None,
             )
             if default_row is None:
-                # fallback на первый элемент, если вдруг справочник не содержит 99/00
                 default_row = dept_records[0]
 
             st.session_state["department_selector"] = default_row
@@ -1033,10 +1039,7 @@ def main():
         )
         selected_department_id = str(selected_department.department_id)
 
-        # подразделение пользователя (из notes_users)
         user_dep_id = user_dept_map.get(selected_login)
-
-        # выбран ли сейчас отдел пользователя
         is_user_department_selected = bool(user_dep_id) and (str(selected_department_id) == str(user_dep_id))
     else:
         selected_department_id = "00"
@@ -1065,18 +1068,14 @@ def main():
 
     current_user_can_create_notebook = selected_login in registered_users
 
-    # --- список книг пользователя (по новой ролевой модели + 99) ---
     notebooks_df = get_notebooks(selected_login, user_dep_id)
 
     filtered_notebooks_df = notebooks_df.copy()
     current_department_id: str = st.session_state.get("current_department_id", "00")
 
-    # фильтр списка книг по выбранному подразделению слева
     if current_department_id != "00" and not filtered_notebooks_df.empty:
         dep_col = filtered_notebooks_df["department_id"].fillna("00").astype(str)
 
-        # ✅ 99 = (Владельцы): показываем ВСЕ книги, где текущий пользователь владелец,
-        # независимо от department_id книги
         if str(current_department_id) == "99":
             owned_ids = (
                 set(owned_notebooks_df["id"].astype(int).tolist())
@@ -1090,9 +1089,9 @@ def main():
             prefix = str(current_department_id).strip()
             prefix_like = prefix + "."
             mask = (
-                (dep_col == "00")                  # "Все" остаётся видимым
-                | (dep_col == prefix)              # точное совпадение
-                | dep_col.str.startswith(prefix_like)  # подчинённые
+                (dep_col == "00")
+                | (dep_col == prefix)
+                | dep_col.str.startswith(prefix_like)
             )
             filtered_notebooks_df = filtered_notebooks_df[mask]
 
@@ -1104,7 +1103,6 @@ def main():
     notebook_records = list(filtered_notebooks_df.itertuples(index=False))
     top_col1, top_col2, top_col3 = st.columns([5, 1, 5])
 
-    # --- диалог "Новая книга" ---
     if current_user_can_create_notebook:
 
         @st.dialog("Новая книга", width="small")
@@ -1122,7 +1120,6 @@ def main():
                 st.success("Книга создана")
                 st.rerun()
 
-    # --- верхняя панель: выбор книги + кнопки ---
     with top_col1:
         select_col, plus_col, info_col = st.columns([14, 2, 2])
 
@@ -1162,7 +1159,6 @@ def main():
             else:
                 st.info("Нет доступных книг")
 
-        # --- диалог "Права доступа на книгу" ---
         if selected_notebook_id is not None and can_edit_notebook:
 
             @st.dialog("Права доступа на книгу", width="small")
@@ -1187,7 +1183,6 @@ def main():
 
                 with st.form(f"access_form_{selected_notebook_id}"):
 
-                    # ✅ область видимости книги: выпадающий список ТОЛЬКО name_department (без id)
                     dept_records_all = list(departments_df.itertuples(index=False)) if not departments_df.empty else []
                     current_nb_dept = str(dept_id or "00")
 
@@ -1202,12 +1197,11 @@ def main():
                         "Область видимости книги (подразделение)",
                         options=dept_records_all,
                         index=dept_records_all.index(current_dept_row) if current_dept_row in dept_records_all else 0,
-                        format_func=lambda r: f"{r.name_department}",  # ✅ только name_department
+                        format_func=lambda r: f"{r.name_department}",
                         key=f"nb_department_{selected_notebook_id}",
                     )
                     new_department_id = str(selected_dept_row.department_id) if selected_dept_row else "00"
 
-                    # добавление владельца
                     selectable_users = [login for login in login_options if login not in owner_logins]
                     new_owner_login = st.selectbox(
                         "Добавить владельца книги",
@@ -1216,7 +1210,6 @@ def main():
                         key=f"add_owner_{selected_notebook_id}",
                     )
 
-                    # удаление владельца (кроме текущего пользователя)
                     removable_owners = [login for login in owner_logins if login != selected_login]
                     remove_owner_login = st.selectbox(
                         "Удалить владельца книги",
@@ -1254,7 +1247,6 @@ def main():
 
     can_edit_notebook = bool(selected_notebook_id and is_notebook_owner(selected_notebook_id, selected_login))
 
-    # --- диалог "Новый раздел" ---
     if can_edit_notebook and selected_notebook_id is not None:
 
         @st.dialog("Новый раздел", width="small")
@@ -1266,7 +1258,6 @@ def main():
                 st.success("Раздел создан")
                 st.rerun()
 
-    # --- диалог "Переименовать / удалить раздел" ---
     if can_edit_notebook and selected_notebook_id is not None:
 
         @st.dialog("Переименовать или удалить раздел", width="small")
@@ -1293,7 +1284,6 @@ def main():
                         st.success("Раздел удалён")
                         st.rerun()
 
-    # --- список разделов ---
     sections_df = pd.DataFrame()
     section_records: list = []
 
@@ -1335,7 +1325,6 @@ def main():
                     if st.button("✎", key="open_section_manage_dialog", help="Переименовать или удалить раздел", use_container_width=True):
                         section_manage_dialog(selected_section)
 
-    # ---------- Загрузка страниц ----------
     dept_notebook_ids = filtered_notebooks_df["id"].astype(int).tolist() if not filtered_notebooks_df.empty else []
 
     if search_text:
@@ -1373,7 +1362,6 @@ def main():
             ]
         )
 
-    # ---------- Кнопки "Новая страница" и "Импорт страниц" в сайдбаре ----------
     new_page_clicked = False
 
     if can_edit_notebook:
@@ -1429,7 +1417,6 @@ def main():
             st.session_state["edit_dialog_page_id"] = new_page_id
             st.rerun()
 
-    # ---------- Список страниц ----------
     df_display = pages_df[["id", "title"]].copy().reset_index(drop=True)
 
     gb = GridOptionsBuilder.from_dataframe(df_display)
@@ -1477,7 +1464,6 @@ def main():
             if (pages_df["id"] == stored_page_id).any():
                 page_id = int(stored_page_id)
 
-    # ---------- Просмотр / редактирование выбранной страницы ----------
     if page_id is not None:
         current_page = pages_df[pages_df["id"] == page_id].iloc[0]
         current_title = current_page.get("title", "")
@@ -1524,25 +1510,47 @@ def main():
         """
         components.html(preview_html, height=600, scrolling=True)
 
+
+
+
+
+
         @st.dialog("Редактирование страницы", width="large")
         def edit_page_dialog(page_id_local: int, title: str, html_body: str, tag: str):
             st.markdown(
-                """
+                f"""
                 <style>
-                div[data-testid="stDialog"] div[role="dialog"]{
+                /* Ширина диалога */
+                div[data-testid="stDialog"] div[role="dialog"] {{
                     width: 96vw !important;
                     max-width: 1400px !important;
-                }
-                div[data-testid="stDialog"] div[role="dialog"] > div{
-                    max-height: 90vh !important;
-                    overflow: auto !important;
-                }
-                div[data-testid="stDialog"] .ql-container{
-                    height: 60vh !important;
-                }
-                div[data-testid="stDialog"] .ql-editor{
-                    min-height: 60vh !important;
-                }
+                }}
+
+                /* Чуть уменьшаем вертикальные отступы в диалоге */
+                div[data-testid="stDialog"] .block-container {{
+                    padding-top: 0.6rem !important;
+                    padding-bottom: 0.6rem !important;
+                }}
+                div[data-testid="stDialog"] [data-testid="stVerticalBlock"] {{
+                    gap: 0.35rem !important;
+                }}
+
+                /* Контейнер, в который мы завернём Quill iframe */
+                .quill-fixed-box-{int(page_id_local)} {{
+                    height: {int(QUILL_IFRAME_HEIGHT_PX)}px !important;
+                    max-height: {int(QUILL_IFRAME_HEIGHT_PX)}px !important;
+                    overflow-y: auto !important;
+                    overflow-x: hidden !important;
+                    border: 1px solid #d0d4da;
+                    border-radius: 6px;
+                    box-sizing: border-box;
+                }}
+
+                /* Внутри контейнера iframe не должен раздвигать диалог */
+                .quill-fixed-box-{int(page_id_local)} > iframe {{
+                    width: 100% !important;
+                    display: block !important;
+                }}
                 </style>
                 """,
                 unsafe_allow_html=True,
@@ -1552,12 +1560,11 @@ def main():
             with col_l:
                 new_title = st.text_input("Название страницы", value=title, key=f"dlg_title_{page_id_local}")
             with col_r:
-                new_tag = st.text_input("Теги", value=tag or "", key=f"dlg_tag_{page_id_local}")
-
-
+                new_tag = st.text_input("Тег", value=tag or "", key=f"dlg_tag_{page_id_local}")
 
             editable_html = html_body or ""
 
+            # --- Quill ---
             quill_value = st_quill(
                 value=editable_html,
                 html=True,
@@ -1565,10 +1572,81 @@ def main():
                 key=f"dlg_quill_{page_id_local}",
             )
 
-            # st_quill иногда возвращает None (например, без изменений) — в этом случае
-            # сохраняем исходный HTML, иначе можно случайно затереть контент.
-            quill_html = editable_html if quill_value is None else (quill_value or "")
+            # ✅ JS: оборачиваем Quill iframe в фиксированный контейнер со скроллом
+            components.html(
+                f"""
+                <script>
+                (function() {{
+                    const BOX_CLASS = "quill-fixed-box-{int(page_id_local)}";
+                    const BOX_ID = "quill_fixed_box_{int(page_id_local)}";
+                    const TARGET_MIN_HEIGHT = 150; // отсечём микроскопические iframes
 
+                    function getDialogRoot() {{
+                        return window.parent.document.querySelector('div[data-testid="stDialog"] div[role="dialog"]');
+                    }}
+
+                    function findQuillIframe(dlg) {{
+                        const iframes = Array.from(dlg.querySelectorAll("iframe"))
+                            .filter(fr => (fr.getBoundingClientRect().height || 0) >= TARGET_MIN_HEIGHT);
+
+                        if (!iframes.length) return null;
+
+                        // берём самый высокий iframe — это почти всегда Quill
+                        iframes.sort((a,b) => (b.getBoundingClientRect().height||0) - (a.getBoundingClientRect().height||0));
+                        return iframes[0];
+                    }}
+
+                    function wrap() {{
+                        const dlg = getDialogRoot();
+                        if (!dlg) return false;
+
+                        const fr = findQuillIframe(dlg);
+                        if (!fr) return false;
+
+                        // если уже завернули — просто обновим класс/стили
+                        const alreadyBox = window.parent.document.getElementById(BOX_ID);
+                        if (alreadyBox && alreadyBox.contains(fr)) {{
+                            alreadyBox.className = BOX_CLASS;
+                            return true;
+                        }}
+
+                        // создаём контейнер
+                        const box = window.parent.document.createElement("div");
+                        box.id = BOX_ID;
+                        box.className = BOX_CLASS;
+
+                        // вставляем контейнер прямо перед iframe и переносим iframe внутрь
+                        const parent = fr.parentElement;
+                        if (!parent) return false;
+
+                        parent.insertBefore(box, fr);
+                        box.appendChild(fr);
+
+                        return true;
+                    }}
+
+                    let tries = 0;
+                    const timer = setInterval(() => {{
+                        tries++;
+                        const ok = wrap();
+                        if (ok || tries > 80) clearInterval(timer);
+                    }}, 120);
+
+                    // на случай, если quill снова перерисует iframe — попробуем перехватить
+                    const dlg = getDialogRoot();
+                    if (dlg) {{
+                        const mo = new MutationObserver(() => wrap());
+                        mo.observe(dlg, {{ childList: true, subtree: true }});
+                        setTimeout(() => mo.disconnect(), 8000);
+                    }}
+                }})();
+                </script>
+                """,
+                height=1,
+                scrolling=False,
+            )
+
+            quill_html = editable_html if quill_value is None else (quill_value or "")
 
             c1, c2 = st.columns([1, 1])
             with c1:
@@ -1584,6 +1662,13 @@ def main():
                 if st.button("Отмена", key=f"dlg_cancel_{page_id_local}", use_container_width=True):
                     st.session_state["edit_dialog_page_id"] = None
                     st.rerun()
+
+
+
+
+
+
+
 
         dlg_pid = st.session_state.get("edit_dialog_page_id")
         if can_edit_notebook and dlg_pid == page_id:
@@ -1626,7 +1711,6 @@ def main():
                     mime="text/plain; charset=windows-1251",
                 )
 
-        # --- Вложения ---
         with col3:
             exp_key = f"attachments_expanded_{page_id}"
             expanded_state = st.session_state.get(exp_key, False)
@@ -1667,7 +1751,6 @@ def main():
                 else:
                     st.caption("Прикреплять файлы могут совладельцы блокнота.")
 
-        # --- Перемещение/копирование ---
         with col4:
             with st.expander("Переместить или скопировать", expanded=False):
                 st.write(f"Текущая страница: **{current_title or f'ID {page_id}'}**")
@@ -1761,7 +1844,6 @@ def main():
                         if cancel_clicked:
                             st.rerun()
 
-        # --- таблица вложений ---
         attachments_df = get_page_attachments(page_id)
         if not attachments_df.empty:
             att_display = attachments_df.copy()
@@ -1773,7 +1855,6 @@ def main():
             att_display["URL"] = att_display["url"].fillna("")
             grid_df = att_display[["id", "Тип", "Название", "Размер", "Создано", "Автор", "URL"]]
 
-            # скрытые ссылки для dblclick по файлу
             links_data = []
             for row in attachments_df.itertuples(index=False):
                 if row.attachment_type == "file":
@@ -1871,37 +1952,17 @@ def main():
                 selected_rows = selected_rows.to_dict("records")
             selected_att = selected_rows[0] if selected_rows else None
 
-
-
-
             if selected_att:
                 att_id = int(selected_att["id"])
                 att_type = selected_att.get("Тип")
                 url_val = selected_att.get("URL") or ""
 
-                # --- Файл ---
                 if att_type == "Файл":
-                    # Метаданные берём из таблицы (без загрузки файла)
-                    row_meta = attachments_df[attachments_df["id"].astype(int) == int(att_id)]
-                    file_name_meta = ""
-                    mime_meta = "application/octet-stream"
-                    file_size_meta = None
-
-                    if not row_meta.empty:
-                        file_name_meta = str(row_meta.iloc[0].get("file_name") or "")
-                        mime_meta = str(row_meta.iloc[0].get("mime_type") or "application/octet-stream")
-                        file_size_meta = row_meta.iloc[0].get("file_size")
-
-                    del_col, _ = st.columns([1,  4])
-
-
-
-                    # Удаление (как было)
                     if can_edit_notebook:
+                        del_col, _ = st.columns([1, 4])
                         with del_col:
                             if st.button("Удалить вложение", key=f"delete_attachment_{att_id}", use_container_width=True):
                                 delete_attachment(att_id)
-                                # очистим кэш скачивания, если удалили то же вложение
                                 if st.session_state.get("download_att_id") == att_id:
                                     st.session_state["download_att_id"] = None
                                     st.session_state["download_payload"] = None
@@ -1909,7 +1970,6 @@ def main():
                                 st.success("Вложение удалено")
                                 st.rerun()
 
-                # --- Ссылка (без изменений) ---
                 elif att_type == "Ссылка":
                     if not url_val:
                         st.warning("Ссылка не указана.")
@@ -1922,12 +1982,6 @@ def main():
                                     st.success("Ссылка удалена")
                                     st.rerun()
 
-
-
-
-
-
-        # --- Удаление страницы (с проверкой вложений) ---
         if can_edit_notebook:
             attachments_df_for_delete = get_page_attachments(page_id)
             has_attachments = not attachments_df_for_delete.empty
