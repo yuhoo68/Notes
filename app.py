@@ -1,16 +1,30 @@
+import logging
+import os
+import streamlit as st
+import streamlit.components.v1 as components
+import subprocess
+import sys
+
+# if "reqs_installed" not in st.session_state:
+#     req_path = os.path.join(os.path.dirname(__file__), "requirements.txt")
+#     if os.path.exists(req_path):
+#         try:
+#             subprocess.check_call([
+#                 sys.executable, "-m", "pip", "install", "--user", "-r", req_path
+#             ])
+#             st.session_state["reqs_installed"] = True
+#         except subprocess.CalledProcessError as e:
+#             print("Ошибка при установке зависимостей:", e)
+#             st.error("Не удалось установить зависимости. См. терминал.")
+
 import base64
 import email
 import io
 import json
-import logging
-import os
 import re
 import urllib.parse
-
 import pandas as pd
 import requests
-import streamlit as st
-import streamlit.components.v1 as components
 from bs4 import BeautifulSoup, NavigableString, Tag
 from docx import Document
 from docx.enum.text import WD_LINE_SPACING
@@ -886,43 +900,90 @@ def export_html_to_docx_bytes(html: str, title: str) -> io.BytesIO:
     return buf
 
 
+# =========================
+# FIX: сохраняем отступы/пробелы для .sql экспорта
+# =========================
 def _html_to_plain_preserving_layout(html: str) -> str:
+    """
+    Преобразует HTML в plain-text так, чтобы:
+      - сохранялись переносы строк
+      - сохранялись пробелы/табы (включая отступы в начале строк)
+      - &nbsp; превращался в обычный пробел
+    ВАЖНО: НЕ схлопывает последовательности пробелов, иначе "умирают" отступы SQL.
+    """
     if not html:
         return ""
 
     soup = BeautifulSoup(html, "html.parser")
 
+    # <br> -> перенос строки
     for br in soup.find_all("br"):
         br.replace_with("\n")
 
     body = soup.body or soup
-    lines: list[str] = []
 
-    def extract_block_text(block: Tag):
+    blocks = ("pre", "p", "div", "li", "h1", "h2", "h3", "h4", "h5", "h6")
+    out_lines: list[str] = []
+
+    def _norm_newlines(s: str) -> str:
+        return s.replace("\r\n", "\n").replace("\r", "\n")
+
+    def _cleanup_preserve_indent(text: str) -> str:
+        # сохраняем ведущие пробелы, но убираем "хвосты" справа у строк,
+        # чтобы .sql не раздувался
+        text = _norm_newlines(text)
+        text = text.replace("\xa0", " ")  # nbsp
+        # rstrip по строкам, но НЕ strip (иначе потеряем отступы слева)
+        return "\n".join(line.rstrip() for line in text.split("\n"))
+
+    def extract_block_text(block: Tag) -> str:
+        # соберём текст, сохраняя то, что уже было в NavigableString,
+        # включая возможные \n от <br>
         parts: list[str] = []
         for elem in block.descendants:
             if isinstance(elem, NavigableString):
                 parts.append(str(elem))
-        raw = "".join(parts).replace("\xa0", " ")
+        raw = "".join(parts)
+        return _cleanup_preserve_indent(raw)
 
-        if raw.replace("\n", "").strip() == "":
-            lines.append("")
-            return
-
-        raw = re.sub(r"[ \t\r\f\v]+", " ", raw)
-        raw = re.sub(r" *\n *", "\n", raw)
-        lines.append(raw.strip())
-
+    # Идём по верхним детям body, чтобы разделять блоки переводами строк
     for child in body.children:
         if isinstance(child, NavigableString):
-            txt = str(child)
-            if txt.strip():
-                lines.append(txt.strip())
-        elif isinstance(child, Tag):
-            if child.name in ("p", "div", "pre", "h1", "h2", "h3", "h4", "h5", "h6", "li"):
-                extract_block_text(child)
+            txt = _cleanup_preserve_indent(str(child))
+            if txt.strip() != "":
+                out_lines.append(txt)
+            continue
 
-    return "\n".join(lines).rstrip()
+        if not isinstance(child, Tag):
+            continue
+
+        if child.name and child.name.lower() in blocks:
+            txt = extract_block_text(child)
+            # если блок пустой — всё равно добавим пустую строку (как визуальный разрыв)
+            if txt.replace("\n", "").strip() == "":
+                out_lines.append("")
+            else:
+                out_lines.append(txt)
+        else:
+            # если это контейнер, попробуем вытащить из него блоки
+            inner_blocks = child.find_all(list(blocks), recursive=True)
+            if inner_blocks:
+                for b in inner_blocks:
+                    txt = extract_block_text(b)
+                    if txt.replace("\n", "").strip() == "":
+                        out_lines.append("")
+                    else:
+                        out_lines.append(txt)
+            else:
+                txt = _cleanup_preserve_indent(child.get_text())
+                if txt.strip() != "":
+                    out_lines.append(txt)
+
+    # Схлопнем слишком много пустых строк (но не трогаем пробелы/инденты)
+    result = "\n".join(out_lines)
+    result = _norm_newlines(result)
+    result = re.sub(r"\n{4,}", "\n\n\n", result)  # максимум 3 пустых строки подряд
+    return result.rstrip()
 
 
 def export_html_to_sql_bytes(html: str, title: str, encoding: str = "utf-8") -> bytes:
@@ -1554,8 +1615,6 @@ def main():
             with col_r:
                 new_tag = st.text_input("Теги", value=tag or "", key=f"dlg_tag_{page_id_local}")
 
-
-
             editable_html = html_body or ""
 
             quill_value = st_quill(
@@ -1568,7 +1627,6 @@ def main():
             # st_quill иногда возвращает None (например, без изменений) — в этом случае
             # сохраняем исходный HTML, иначе можно случайно затереть контент.
             quill_html = editable_html if quill_value is None else (quill_value or "")
-
 
             c1, c2 = st.columns([1, 1])
             with c1:
@@ -1871,9 +1929,6 @@ def main():
                 selected_rows = selected_rows.to_dict("records")
             selected_att = selected_rows[0] if selected_rows else None
 
-
-
-
             if selected_att:
                 att_id = int(selected_att["id"])
                 att_type = selected_att.get("Тип")
@@ -1881,7 +1936,6 @@ def main():
 
                 # --- Файл ---
                 if att_type == "Файл":
-                    # Метаданные берём из таблицы (без загрузки файла)
                     row_meta = attachments_df[attachments_df["id"].astype(int) == int(att_id)]
                     file_name_meta = ""
                     mime_meta = "application/octet-stream"
@@ -1894,14 +1948,10 @@ def main():
 
                     del_col, _ = st.columns([1,  4])
 
-
-
-                    # Удаление (как было)
                     if can_edit_notebook:
                         with del_col:
                             if st.button("Удалить вложение", key=f"delete_attachment_{att_id}", use_container_width=True):
                                 delete_attachment(att_id)
-                                # очистим кэш скачивания, если удалили то же вложение
                                 if st.session_state.get("download_att_id") == att_id:
                                     st.session_state["download_att_id"] = None
                                     st.session_state["download_payload"] = None
@@ -1909,7 +1959,7 @@ def main():
                                 st.success("Вложение удалено")
                                 st.rerun()
 
-                # --- Ссылка (без изменений) ---
+                # --- Ссылка ---
                 elif att_type == "Ссылка":
                     if not url_val:
                         st.warning("Ссылка не указана.")
@@ -1921,11 +1971,6 @@ def main():
                                     delete_attachment(att_id)
                                     st.success("Ссылка удалена")
                                     st.rerun()
-
-
-
-
-
 
         # --- Удаление страницы (с проверкой вложений) ---
         if can_edit_notebook:
