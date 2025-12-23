@@ -901,15 +901,16 @@ def export_html_to_docx_bytes(html: str, title: str) -> io.BytesIO:
 
 
 # =========================
-# FIX: сохраняем отступы/пробелы для .sql экспорта
+# FIX: сохраняем отступы/пробелы для .sql экспорта + корректный текст для буфера
 # =========================
-def _html_to_plain_preserving_layout(html: str) -> str:
+def _html_to_plain_preserving_layout(html: str, indent_spaces: int = 4) -> str:
     """
     Преобразует HTML в plain-text так, чтобы:
       - сохранялись переносы строк
       - сохранялись пробелы/табы (включая отступы в начале строк)
       - &nbsp; превращался в обычный пробел
-    ВАЖНО: НЕ схлопывает последовательности пробелов, иначе "умирают" отступы SQL.
+      - восстанавливались отступы Quill по классам ql-indent-N (N * indent_spaces)
+      - не появлялись "пустые строки между каждым абзацем" при копировании/экспорте
     """
     if not html:
         return ""
@@ -922,75 +923,190 @@ def _html_to_plain_preserving_layout(html: str) -> str:
 
     body = soup.body or soup
 
-    blocks = ("pre", "p", "div", "li", "h1", "h2", "h3", "h4", "h5", "h6")
+    block_tags = {"p", "div", "li", "pre", "h1", "h2", "h3", "h4", "h5", "h6"}
     out_lines: list[str] = []
 
     def _norm_newlines(s: str) -> str:
         return s.replace("\r\n", "\n").replace("\r", "\n")
 
-    def _cleanup_preserve_indent(text: str) -> str:
-        # сохраняем ведущие пробелы, но убираем "хвосты" справа у строк,
-        # чтобы .sql не раздувался
-        text = _norm_newlines(text)
-        text = text.replace("\xa0", " ")  # nbsp
-        # rstrip по строкам, но НЕ strip (иначе потеряем отступы слева)
-        return "\n".join(line.rstrip() for line in text.split("\n"))
+    def _indent_level(tag: Tag) -> int:
+        classes = tag.get("class") or []
+        for c in classes:
+            m = re.match(r"ql-indent-(\d+)", str(c))
+            if m:
+                return int(m.group(1))
+        return 0
 
-    def extract_block_text(block: Tag) -> str:
-        # соберём текст, сохраняя то, что уже было в NavigableString,
-        # включая возможные \n от <br>
+    def _text_of(tag: Tag) -> str:
         parts: list[str] = []
-        for elem in block.descendants:
+        for elem in tag.descendants:
             if isinstance(elem, NavigableString):
                 parts.append(str(elem))
         raw = "".join(parts)
-        return _cleanup_preserve_indent(raw)
+        raw = _norm_newlines(raw).replace("\xa0", " ")
+        # сохраняем ведущие пробелы (важно для SQL), но убираем хвосты справа
+        return "\n".join(line.rstrip() for line in raw.split("\n"))
 
-    # Идём по верхним детям body, чтобы разделять блоки переводами строк
-    for child in body.children:
-        if isinstance(child, NavigableString):
-            txt = _cleanup_preserve_indent(str(child))
-            if txt.strip() != "":
-                out_lines.append(txt)
-            continue
+    # Берём блоки как строки (а не get_text всего body), чтобы не получать “двойные” пустые строки
+    blocks = body.find_all(list(block_tags))
+    if blocks:
+        for el in blocks:
+            txt = _text_of(el)
 
-        if not isinstance(child, Tag):
-            continue
-
-        if child.name and child.name.lower() in blocks:
-            txt = extract_block_text(child)
-            # если блок пустой — всё равно добавим пустую строку (как визуальный разрыв)
             if txt.replace("\n", "").strip() == "":
                 out_lines.append("")
-            else:
-                out_lines.append(txt)
-        else:
-            # если это контейнер, попробуем вытащить из него блоки
-            inner_blocks = child.find_all(list(blocks), recursive=True)
-            if inner_blocks:
-                for b in inner_blocks:
-                    txt = extract_block_text(b)
-                    if txt.replace("\n", "").strip() == "":
-                        out_lines.append("")
-                    else:
-                        out_lines.append(txt)
-            else:
-                txt = _cleanup_preserve_indent(child.get_text())
-                if txt.strip() != "":
-                    out_lines.append(txt)
+                continue
 
-    # Схлопнем слишком много пустых строк (но не трогаем пробелы/инденты)
+            lvl = _indent_level(el)
+            prefix = (" " * (lvl * indent_spaces)) if lvl > 0 else ""
+
+            for line in txt.split("\n"):
+                if line == "":
+                    out_lines.append("")
+                else:
+                    out_lines.append(prefix + line)
+    else:
+        # fallback, если почему-то блоки не найдены
+        txt = _text_of(body)
+        out_lines.extend(txt.split("\n"))
+
     result = "\n".join(out_lines)
     result = _norm_newlines(result)
-    result = re.sub(r"\n{4,}", "\n\n\n", result)  # максимум 3 пустых строки подряд
-    return result.rstrip()
+    # максимум 2 пустых строки подряд
+    result = re.sub(r"\n{3,}", "\n\n", result).rstrip()
+    return result
+
+
+def _sql_text_from_html(html: str, title: str) -> str:
+    plain = _html_to_plain_preserving_layout(html or "")
+    header = f"-- {title or ''}".rstrip()
+    return header + ("\n\n" + plain if plain else "\n")
 
 
 def export_html_to_sql_bytes(html: str, title: str, encoding: str = "utf-8") -> bytes:
-    plain = _html_to_plain_preserving_layout(html or "")
-    header = f"-- {title or ''}".rstrip()
-    full_text = header + ("\n\n" + plain if plain else "\n")
+    full_text = _sql_text_from_html(html or "", title or "")
     return full_text.encode(encoding, errors="replace")
+
+
+def _clipboard_write_text_js(text: str) -> str:
+    """
+    JS-скрипт, который кладёт text в буфер обмена.
+    С fallback на execCommand.
+    """
+    js_text = json.dumps(text)  # безопасно экранирует для JS
+    return f"""
+    <script>
+    (async function() {{
+        try {{
+            await navigator.clipboard.writeText({js_text});
+        }} catch (e) {{
+            const ta = document.createElement('textarea');
+            ta.value = {js_text};
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand('copy');
+            document.body.removeChild(ta);
+        }}
+    }})();
+    </script>
+    """
+
+
+def render_copy_sql_button(sql_text: str, btn_key: str) -> None:
+    """
+    Рендерит кнопку копирования SQL через components.html так,
+    чтобы копирование выполнялось в обработчике клика (user gesture),
+    иначе браузер блокирует доступ к clipboard.
+    """
+    payload = json.dumps(sql_text or "")
+    safe_id = re.sub(r"[^a-zA-Z0-9_\-]", "_", btn_key)
+
+    components.html(
+        f"""
+        <div style="display:flex; justify-content:flex-end; align-items:center; width:100%; margin:0; padding:0;">
+          <button id="copy_btn_{safe_id}"
+                  style="
+                    cursor:pointer;
+                    padding:0.35rem 0.75rem;
+                    border:1px solid rgba(49,51,63,.2);
+                    border-radius:0.5rem;
+                    background: white;
+                    font-size:14px;
+                    line-height:1.2;
+                  ">
+            📋 Копировать
+          </button>
+          <span id="copy_msg_{safe_id}" style="margin-left:10px; font-size:13px;"></span>
+        </div>
+
+        <script>
+        (function() {{
+          const text = {payload};
+          const btn = document.getElementById("copy_btn_{safe_id}");
+          const msg = document.getElementById("copy_msg_{safe_id}");
+
+          function ok(message) {{
+            if (!msg) return;
+            msg.textContent = message || "Скопировано";
+            msg.style.color = "green";
+            setTimeout(() => {{ msg.textContent = ""; }}, 2500);
+          }}
+
+          function fail(message) {{
+            if (!msg) return;
+            msg.textContent = message || "Не удалось скопировать";
+            msg.style.color = "crimson";
+            setTimeout(() => {{ msg.textContent = ""; }}, 4000);
+          }}
+
+          async function copy() {{
+            try {{
+              // Основной способ
+              if (navigator.clipboard && navigator.clipboard.writeText) {{
+                await navigator.clipboard.writeText(text);
+                ok("Скопировано");
+                return;
+              }}
+            }} catch (e) {{
+              // упадём в fallback ниже
+            }}
+
+            // Fallback (часто работает там, где clipboard API запрещён)
+            try {{
+              const ta = document.createElement("textarea");
+              ta.value = text;
+              ta.setAttribute("readonly", "");
+              ta.style.position = "fixed";
+              ta.style.left = "-9999px";
+              ta.style.top = "0";
+              document.body.appendChild(ta);
+              ta.select();
+              const res = document.execCommand("copy");
+              document.body.removeChild(ta);
+              if (res) {{
+                ok("SQL скопирован в буфер обмена.");
+              }} else {{
+                fail("Браузер запретил копирование.");
+              }}
+            }} catch (e2) {{
+              fail("Браузер запретил копирование.");
+            }}
+          }}
+
+          if (btn) {{
+            btn.addEventListener("click", function(ev) {{
+              ev.preventDefault();
+              ev.stopPropagation();
+              copy();
+            }});
+          }}
+        }})();
+        </script>
+        """,
+        height=42,           # ✅ маленькая фиксированная высота → не появится “пустая область”
+        scrolling=False,
+    )
+
 
 
 def main():
@@ -1549,12 +1665,21 @@ def main():
         dept_name_for_page = department_map.get(dept_id_for_page, "") if dept_id_for_page else ""
         dept_prefix = f"[{dept_name_for_page}] " if dept_name_for_page else ""
 
-        st.caption(
-            f"{dept_prefix}  {current_page['notebook_name']}  =>  "
-            f"{current_page['section_name']}  =>  {current_page['title']}"
-        )
-        if current_tag:
-            st.caption(f"Tag: {current_tag}")
+        # ======= строка: информация о странице (слева) + кнопка "Скопировать" (справа) =======
+        safe_title = current_title or f"Страница_{page_id}"
+        info_left, info_right = st.columns([12, 3])
+        with info_left:
+            st.caption(
+                f"{dept_prefix}  {current_page['notebook_name']}  =>  "
+                f"{current_page['section_name']}  =>  {current_page['title']}"
+            )
+            if current_tag:
+                st.caption(f"Tag: {current_tag}")
+
+        with info_right:
+            sql_text = _sql_text_from_html(current_html or "", safe_title)
+            render_copy_sql_button(sql_text, btn_key=f"copy_sql_utf8_{page_id}")
+
 
         preview_html = f"""
         <style>
@@ -1660,8 +1785,6 @@ def main():
 
         with col2:
             with st.expander("Экспорт", expanded=False):
-                safe_title = current_title or f"Страница_{page_id}"
-
                 docx_bytes = export_html_to_docx_bytes(current_html, safe_title)
                 st.download_button(
                     ".docx",
@@ -2019,3 +2142,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
