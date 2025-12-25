@@ -23,8 +23,6 @@ import io
 import json
 import re
 import urllib.parse
-from typing import Optional
-
 import pandas as pd
 import requests
 from bs4 import BeautifulSoup, NavigableString, Tag
@@ -33,14 +31,6 @@ from docx.enum.text import WD_LINE_SPACING
 from docx.shared import Inches, Pt
 from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
 from streamlit_quill import st_quill
-
-# ---- XSS sanitize (bleach optional) ----
-try:
-    import bleach  # type: ignore
-    HAVE_BLEACH = True
-except Exception:
-    bleach = None
-    HAVE_BLEACH = False
 
 import config
 from src.database_utils_DRP import get_execute, get_fetch, test_connection
@@ -66,129 +56,6 @@ logger = logging.getLogger("notes_app")
 def _escape(val: str) -> str:
     """Минимальное экранирование строк для SQL."""
     return (val or "").replace("'", "''")
-
-
-# =========================
-# XSS protection (sanitize HTML)
-# =========================
-_DANGEROUS_TAGS = {
-    "script", "iframe", "object", "embed", "link", "meta", "base",
-    "form", "input", "button", "textarea", "select", "option",
-    "svg", "math",
-}
-
-
-def _is_bad_url(url: str) -> bool:
-    u = (url or "").strip().lower()
-    return (
-        u.startswith("javascript:")
-        or u.startswith("vbscript:")
-        or u.startswith("data:text/html")
-        or u.startswith("data:application/xhtml+xml")
-    )
-
-
-def _clean_style_attr(style: str) -> str:
-    """
-    Минимальная чистка CSS.
-    Убираем expression(), javascript: и url(javascript:...)
-    """
-    s = (style or "")
-    s = re.sub(r"expression\s*\([^)]*\)", "", s, flags=re.I)
-    s = re.sub(r"javascript\s*:", "", s, flags=re.I)
-    s = re.sub(r"url\s*\(\s*['\"]?\s*javascript:[^)]*\)", "", s, flags=re.I)
-    s = re.sub(r"[\x00-\x1f\x7f]", "", s)
-    return s.strip()
-
-
-def sanitize_html_xss(html: str) -> str:
-    """
-    Санитизация HTML против XSS.
-    1) Если установлен bleach — используем whitelist.
-    2) Иначе — fallback через BeautifulSoup: удаляем опасные теги и атрибуты.
-    """
-    if not html:
-        return ""
-
-    if HAVE_BLEACH and bleach is not None:
-        allowed_tags = [
-            "p", "br", "div", "span",
-            "b", "strong", "i", "em", "u", "s",
-            "sub", "sup", "blockquote", "pre", "code",
-            "h1", "h2", "h3", "h4", "h5", "h6",
-            "ul", "ol", "li",
-            "table", "thead", "tbody", "tfoot", "tr", "th", "td", "colgroup", "col",
-            "a", "img",
-        ]
-        allowed_attrs = {
-            "*": ["style", "class"],
-            "a": ["href", "title", "target", "rel", "name"],
-            "img": ["src", "alt", "title", "width", "height"],
-            "td": ["colspan", "rowspan"],
-            "th": ["colspan", "rowspan"],
-            "col": ["span", "width"],
-        }
-
-        cleaned = bleach.clean(
-            html,
-            tags=allowed_tags,
-            attributes=allowed_attrs,
-            protocols=["http", "https", "mailto", "data"],
-            strip=True,
-        )
-
-        soup = BeautifulSoup(cleaned, "html.parser")
-        for tag in soup.find_all(True):
-            # remove event handlers
-            for attr in list(tag.attrs.keys()):
-                if str(attr).lower().startswith("on"):
-                    del tag.attrs[attr]
-
-            if tag.has_attr("href") and _is_bad_url(tag.get("href", "")):
-                del tag.attrs["href"]
-            if tag.has_attr("src") and _is_bad_url(tag.get("src", "")):
-                del tag.attrs["src"]
-
-            if tag.has_attr("style"):
-                tag.attrs["style"] = _clean_style_attr(tag.attrs.get("style", ""))
-
-            if tag.name and tag.name.lower() == "a":
-                rel = (tag.get("rel") or [])
-                if isinstance(rel, str):
-                    rel = [rel]
-                rel_set = set([r.lower() for r in rel])
-                rel_set.update({"noopener", "noreferrer"})
-                tag["rel"] = " ".join(sorted(rel_set))
-
-        return str(soup)
-
-    soup = BeautifulSoup(html, "html.parser")
-
-    for bad in soup.find_all(list(_DANGEROUS_TAGS)):
-        bad.decompose()
-
-    for tag in soup.find_all(True):
-        for attr in list(tag.attrs.keys()):
-            if str(attr).lower().startswith("on"):
-                del tag.attrs[attr]
-
-        if tag.has_attr("href") and _is_bad_url(tag.get("href", "")):
-            del tag.attrs["href"]
-        if tag.has_attr("src") and _is_bad_url(tag.get("src", "")):
-            del tag.attrs["src"]
-
-        if tag.has_attr("style"):
-            tag.attrs["style"] = _clean_style_attr(tag.attrs.get("style", ""))
-
-        if tag.name and tag.name.lower() == "a":
-            rel = (tag.get("rel") or [])
-            if isinstance(rel, str):
-                rel = [rel]
-            rel_set = set([r.lower() for r in rel])
-            rel_set.update({"noopener", "noreferrer"})
-            tag["rel"] = " ".join(sorted(rel_set))
-
-    return str(soup)
 
 
 def _name_patronymic(full_name: str | None, fallback_login: str) -> str:
@@ -339,7 +206,7 @@ def set_notebook_department(notebook_id: int, department_id: str | None) -> None
 
     - '00' или NULL -> видна всем
     - '01.01'       -> видна пользователям из '01.01' и ниже ('01.01.*')
-    - '99'          -> видна только владельцам книги (notes_notebook_owners)
+    - '99'          -> видна только создателю книги (created_by = текущий пользователь)
     """
     dep_value = "NULL" if not department_id else f"'{_escape(department_id)}'"
     logger.info(
@@ -595,14 +462,13 @@ def create_page(section_id: int, user_login: str, title: str | None = None) -> i
 
 
 def insert_page_with_content(section_id: int, title: str, body_html: str, user_login: str) -> int:
-    # ✅ Оставляем санитизацию ТОЛЬКО per-page внутри parse_mht_to_pages().
     new_id = run_scalar(
         f"""
         INSERT INTO {PAGES_TABLE} (section_id, title, tag, body_html, created_by)
         VALUES ({int(section_id)},
                 '{_escape(title.strip() or 'Untitled')}',
                 '',
-                '{_escape(body_html or "")}',
+                '{_escape(body_html)}',
                 '{_escape(user_login)}')
         RETURNING id
         """
@@ -613,13 +479,12 @@ def insert_page_with_content(section_id: int, title: str, body_html: str, user_l
 
 
 def update_page(page_id: int, title: str, body_html: str, tag: str) -> None:
-    # ✅ Оставляем санитизацию ТОЛЬКО per-page внутри parse_mht_to_pages().
     run_execute(
         f"""
         UPDATE {PAGES_TABLE}
         SET title = '{_escape(title.strip() or 'Без названия')}',
             tag = '{_escape(tag)}',
-            body_html = '{_escape(body_html or "")}',
+            body_html = '{_escape(body_html)}',
             updated_at = NOW()
         WHERE id = {int(page_id)}
         """
@@ -736,11 +601,6 @@ def save_link_attachment(page_id: int, url: str, title: str, user_login: str) ->
     cleaned_url = (url or "").strip()
     if not cleaned_url:
         raise ValueError("URL не указан.")
-
-    low = cleaned_url.lower()
-    if low.startswith(("javascript:", "vbscript:", "data:text/html", "data:application/xhtml+xml")):
-        raise ValueError("Запрещённый URL (возможная XSS-атака).")
-
     name = (title or "").strip() or cleaned_url
     run_execute(
         f"""
@@ -786,11 +646,6 @@ def _split_onenote_html_into_pages(soup: BeautifulSoup, filename: str):
 
 
 def parse_mht_to_pages(data: bytes, filename: str):
-    """
-    Парсим MHT и возвращаем список страниц (title, html).
-    ✅ "Железобетон": XSS-санитизация делается на уровне каждой страницы (per page)
-       Сразу после split — до попадания в insert/update.
-    """
     msg = email.message_from_bytes(data)
     html_part = None
     resources: list[tuple[str, bytes, str | None, str | None]] = []
@@ -846,17 +701,7 @@ def parse_mht_to_pages(data: bytes, filename: str):
             if basename in src_map:
                 tag["src"] = src_map[basename]
 
-    pages = _split_onenote_html_into_pages(soup, filename)
-
-    # ✅ per-page sanitize (и только здесь)
-    safe_pages: list[tuple[str, str]] = []
-    base_title = filename.rsplit(".", 1)[0]
-    for title, body_html in pages:
-        safe_title = (title or "").strip() or base_title
-        safe_body = sanitize_html_xss(body_html or "")
-        safe_pages.append((safe_title, safe_body))
-
-    return safe_pages
+    return _split_onenote_html_into_pages(soup, filename)
 
 
 def parse_mht_to_html(data: bytes, filename: str):
@@ -1099,8 +944,10 @@ def _html_to_plain_preserving_layout(html: str, indent_spaces: int = 4) -> str:
                 parts.append(str(elem))
         raw = "".join(parts)
         raw = _norm_newlines(raw).replace("\xa0", " ")
+        # сохраняем ведущие пробелы (важно для SQL), но убираем хвосты справа
         return "\n".join(line.rstrip() for line in raw.split("\n"))
 
+    # Берём блоки как строки (а не get_text всего body), чтобы не получать “двойные” пустые строки
     blocks = body.find_all(list(block_tags))
     if blocks:
         for el in blocks:
@@ -1119,11 +966,13 @@ def _html_to_plain_preserving_layout(html: str, indent_spaces: int = 4) -> str:
                 else:
                     out_lines.append(prefix + line)
     else:
+        # fallback, если почему-то блоки не найдены
         txt = _text_of(body)
         out_lines.extend(txt.split("\n"))
 
     result = "\n".join(out_lines)
     result = _norm_newlines(result)
+    # максимум 2 пустых строки подряд
     result = re.sub(r"\n{3,}", "\n\n", result).rstrip()
     return result
 
@@ -1140,7 +989,11 @@ def export_html_to_sql_bytes(html: str, title: str, encoding: str = "utf-8") -> 
 
 
 def _clipboard_write_text_js(text: str) -> str:
-    js_text = json.dumps(text)
+    """
+    JS-скрипт, который кладёт text в буфер обмена.
+    С fallback на execCommand.
+    """
+    js_text = json.dumps(text)  # безопасно экранирует для JS
     return f"""
     <script>
     (async function() {{
@@ -1208,13 +1061,17 @@ def render_copy_sql_button(sql_text: str, btn_key: str) -> None:
 
           async function copy() {{
             try {{
+              // Основной способ
               if (navigator.clipboard && navigator.clipboard.writeText) {{
                 await navigator.clipboard.writeText(text);
                 ok("Скопировано");
                 return;
               }}
-            }} catch (e) {{}}
+            }} catch (e) {{
+              // упадём в fallback ниже
+            }}
 
+            // Fallback (часто работает там, где clipboard API запрещён)
             try {{
               const ta = document.createElement("textarea");
               ta.value = text;
@@ -1246,13 +1103,15 @@ def render_copy_sql_button(sql_text: str, btn_key: str) -> None:
         }})();
         </script>
         """,
-        height=42,
+        height=42,           # ✅ маленькая фиксированная высота → не появится “пустая область”
         scrolling=False,
     )
 
 
 def _close_edit_dialog_state():
+    # если диалог был “логически” открыт — закрываем его, чтобы rerun от export не открывал снова
     st.session_state["edit_dialog_page_id"] = None
+
 
 
 def main():
@@ -1310,15 +1169,19 @@ def main():
         for row in departments_df.itertuples(index=False)
     }
 
+    # --- Подразделение пользователя ---
     user_dep_id = user_dept_map.get(selected_login)
 
+    # --- Левый сайдбар: выбор подразделения (включая 99) ---
     selected_department_id = "00"
     dept_records = list(departments_df.itertuples(index=False)) if not departments_df.empty else []
 
     is_user_department_selected = False
+
     forced_department_id = st.session_state.pop("force_department_id", None)
 
     if dept_records:
+        # 1) если только что создавали книгу – форсим подразделение книги
         if forced_department_id:
             forced_row = next(
                 (r for r in dept_records if str(r.department_id) == str(forced_department_id)),
@@ -1327,6 +1190,9 @@ def main():
             if forced_row is not None:
                 st.session_state["department_selector"] = forced_row
 
+        # 2) если selector ещё не задан — ставим дефолт:
+        #    - 99 (Владельцы), если у пользователя есть свои книги (owners)
+        #    - иначе 00 (Все)
         if "department_selector" not in st.session_state and not forced_department_id:
             has_owned_books = not owned_notebooks_df.empty
             default_dep_id = "99" if has_owned_books else "00"
@@ -1336,6 +1202,7 @@ def main():
                 None,
             )
             if default_row is None:
+                # fallback на первый элемент, если вдруг справочник не содержит 99/00
                 default_row = dept_records[0]
 
             st.session_state["department_selector"] = default_row
@@ -1348,7 +1215,10 @@ def main():
         )
         selected_department_id = str(selected_department.department_id)
 
+        # подразделение пользователя (из notes_users)
         user_dep_id = user_dept_map.get(selected_login)
+
+        # выбран ли сейчас отдел пользователя
         is_user_department_selected = bool(user_dep_id) and (str(selected_department_id) == str(user_dep_id))
     else:
         selected_department_id = "00"
@@ -1356,6 +1226,7 @@ def main():
 
     st.session_state["current_department_id"] = selected_department_id
 
+    # --- поиск страниц ---
     def _clear_page_search():
         st.session_state["page_search"] = ""
 
@@ -1375,14 +1246,19 @@ def main():
     search_text = search_raw[1:].strip() if search_tags_only else search_raw
 
     current_user_can_create_notebook = selected_login in registered_users
+
+    # --- список книг пользователя (по новой ролевой модели + 99) ---
     notebooks_df = get_notebooks(selected_login, user_dep_id)
 
     filtered_notebooks_df = notebooks_df.copy()
     current_department_id: str = st.session_state.get("current_department_id", "00")
 
+    # фильтр списка книг по выбранному подразделению слева
     if current_department_id != "00" and not filtered_notebooks_df.empty:
         dep_col = filtered_notebooks_df["department_id"].fillna("00").astype(str)
 
+        # ✅ 99 = (Владельцы): показываем ВСЕ книги, где текущий пользователь владелец,
+        # независимо от department_id книги
         if str(current_department_id) == "99":
             owned_ids = (
                 set(owned_notebooks_df["id"].astype(int).tolist())
@@ -1396,9 +1272,9 @@ def main():
             prefix = str(current_department_id).strip()
             prefix_like = prefix + "."
             mask = (
-                (dep_col == "00")
-                | (dep_col == prefix)
-                | dep_col.str.startswith(prefix_like)
+                (dep_col == "00")                  # "Все" остаётся видимым
+                | (dep_col == prefix)              # точное совпадение
+                | dep_col.str.startswith(prefix_like)  # подчинённые
             )
             filtered_notebooks_df = filtered_notebooks_df[mask]
 
@@ -1410,6 +1286,7 @@ def main():
     notebook_records = list(filtered_notebooks_df.itertuples(index=False))
     top_col1, top_col2, top_col3 = st.columns([5, 1, 5])
 
+    # --- диалог "Новая книга" ---
     if current_user_can_create_notebook:
 
         @st.dialog("Новая книга", width="small")
@@ -1427,6 +1304,7 @@ def main():
                 st.success("Книга создана")
                 st.rerun()
 
+    # --- верхняя панель: выбор книги + кнопки ---
     with top_col1:
         select_col, plus_col, info_col = st.columns([14, 2, 2])
 
@@ -1466,6 +1344,82 @@ def main():
             else:
                 st.info("Нет доступных книг")
 
+        # --- диалог "Права доступа на книгу" ---
+        if selected_notebook_id is not None and can_edit_notebook:
+
+            @st.dialog("Права доступа на книгу", width="small")
+            def notebook_access_dialog():
+                owners_df = get_notebook_owners(selected_notebook_id)
+                owners_text = (
+                    ", ".join(
+                        f"{row.full_name or row.login} ({row.login})"
+                        for row in owners_df.itertuples(index=False)
+                    )
+                    or "Нет владельцев"
+                )
+
+                dept_id = selected_notebook_row.get("department_id", None)
+                dept_id = "00" if dept_id is None or str(dept_id).strip() == "" else str(dept_id)
+                dept_value = department_map.get(dept_id, "не задано")
+
+                st.caption(f"Подразделение (видимость): {dept_value}")
+                st.caption(f"Владельцы: {owners_text}")
+
+                owner_logins = set(owners_df["login"].tolist()) if not owners_df.empty else set()
+
+                with st.form(f"access_form_{selected_notebook_id}"):
+
+                    # ✅ область видимости книги: выпадающий список ТОЛЬКО name_department (без id)
+                    dept_records_all = list(departments_df.itertuples(index=False)) if not departments_df.empty else []
+                    current_nb_dept = str(dept_id or "00")
+
+                    current_dept_row = next(
+                        (r for r in dept_records_all if str(r.department_id) == current_nb_dept),
+                        None,
+                    )
+                    if current_dept_row is None and dept_records_all:
+                        current_dept_row = dept_records_all[0]
+
+                    selected_dept_row = st.selectbox(
+                        "Область видимости книги (подразделение)",
+                        options=dept_records_all,
+                        index=dept_records_all.index(current_dept_row) if current_dept_row in dept_records_all else 0,
+                        format_func=lambda r: f"{r.name_department}",  # ✅ только name_department
+                        key=f"nb_department_{selected_notebook_id}",
+                    )
+                    new_department_id = str(selected_dept_row.department_id) if selected_dept_row else "00"
+
+                    # добавление владельца
+                    selectable_users = [login for login in login_options if login not in owner_logins]
+                    new_owner_login = st.selectbox(
+                        "Добавить владельца книги",
+                        options=[""] + selectable_users,
+                        format_func=lambda login: "—" if login == "" else f"{user_map.get(login, login)} ({login})",
+                        key=f"add_owner_{selected_notebook_id}",
+                    )
+
+                    # удаление владельца (кроме текущего пользователя)
+                    removable_owners = [login for login in owner_logins if login != selected_login]
+                    remove_owner_login = st.selectbox(
+                        "Удалить владельца книги",
+                        options=[""] + removable_owners,
+                        format_func=lambda login: "—" if login == "" else f"{user_map.get(login, login)} ({login})",
+                        key=f"remove_owner_{selected_notebook_id}",
+                    )
+
+                    submitted = st.form_submit_button("Сохранить доступы")
+                    if submitted:
+                        set_notebook_department(selected_notebook_id, new_department_id)
+
+                        if new_owner_login:
+                            add_notebook_owner(selected_notebook_id, new_owner_login)
+
+                        if remove_owner_login and remove_owner_login != selected_login:
+                            remove_notebook_owner(selected_notebook_id, remove_owner_login)
+
+                        st.success("Доступы обновлены")
+                        st.rerun()
+
         if current_user_can_create_notebook:
             with plus_col:
                 st.markdown("###### ")
@@ -1473,8 +1427,55 @@ def main():
                 if st.button("➕", key="open_new_notebook_dialog", help="Создать новую книгу", use_container_width=True):
                     new_notebook_dialog()
 
+        if selected_notebook_id is not None and can_edit_notebook:
+            with info_col:
+                st.markdown("###### ")
+                st.markdown("###### ")
+                if st.button("🔐", key="open_notebook_access_dialog", help="Права доступа на книгу", use_container_width=True):
+                    notebook_access_dialog()
+
     can_edit_notebook = bool(selected_notebook_id and is_notebook_owner(selected_notebook_id, selected_login))
 
+    # --- диалог "Новый раздел" ---
+    if can_edit_notebook and selected_notebook_id is not None:
+
+        @st.dialog("Новый раздел", width="small")
+        def new_section_dialog():
+            new_section_name = st.text_input("Название раздела", key="new_section_name_modal")
+            create_clicked = st.button("Создать раздел", key="create_section_btn_modal")
+            if create_clicked:
+                create_section(selected_notebook_id, new_section_name, selected_login)
+                st.success("Раздел создан")
+                st.rerun()
+
+    # --- диалог "Переименовать / удалить раздел" ---
+    if can_edit_notebook and selected_notebook_id is not None:
+
+        @st.dialog("Переименовать или удалить раздел", width="small")
+        def section_manage_dialog(section_row):
+            section_id_local = int(section_row.id)
+            st.caption(f"Текущий раздел: **{section_row.name}**")
+
+            new_name = st.text_input("Новое название раздела", value=section_row.name, key=f"rename_section_name_{section_id_local}")
+            pages_cnt = get_section_pages_count(section_id_local)
+
+            col_rename, col_delete = st.columns(2)
+            with col_rename:
+                if st.button("Сохранить название", key=f"btn_rename_section_{section_id_local}", use_container_width=True):
+                    rename_section(section_id_local, new_name)
+                    st.success("Название раздела обновлено")
+                    st.rerun()
+
+            with col_delete:
+                if pages_cnt > 0:
+                    st.caption(f"В разделе есть страницы ({pages_cnt}). Удаление недоступно.")
+                else:
+                    if st.button("Удалить раздел", key=f"btn_delete_section_{section_id_local}", use_container_width=True, type="secondary"):
+                        delete_section(section_id_local)
+                        st.success("Раздел удалён")
+                        st.rerun()
+
+    # --- список разделов ---
     sections_df = pd.DataFrame()
     section_records: list = []
 
@@ -1502,6 +1503,21 @@ def main():
             else:
                 st.warning("В книге нет разделов.")
 
+        if can_edit_notebook:
+            with plus_col2:
+                st.markdown("###### ")
+                st.markdown("###### ")
+                if st.button("➕", key="open_new_section_dialog", help="Создать новый раздел", use_container_width=True):
+                    new_section_dialog()
+
+            with manage_col2:
+                st.markdown("###### ")
+                st.markdown("###### ")
+                if selected_section is not None:
+                    if st.button("✎", key="open_section_manage_dialog", help="Переименовать или удалить раздел", use_container_width=True):
+                        section_manage_dialog(selected_section)
+
+    # ---------- Загрузка страниц ----------
     dept_notebook_ids = filtered_notebooks_df["id"].astype(int).tolist() if not filtered_notebooks_df.empty else []
 
     if search_text:
@@ -1539,6 +1555,7 @@ def main():
             ]
         )
 
+    # ---------- Кнопки "Новая страница" и "Импорт страниц" в сайдбаре ----------
     new_page_clicked = False
 
     if can_edit_notebook:
@@ -1561,7 +1578,7 @@ def main():
                 errors: list[str] = []
                 for file in uploaded:
                     try:
-                        pages = parse_mht_to_pages(file.getvalue(), file.name)  # ✅ per-page sanitize внутри
+                        pages = parse_mht_to_pages(file.getvalue(), file.name)
                         for title, body_html in pages:
                             insert_page_with_content(selected_section_id, title, body_html, selected_login)
                             imported += 1
@@ -1594,6 +1611,7 @@ def main():
             st.session_state["edit_dialog_page_id"] = new_page_id
             st.rerun()
 
+    # ---------- Список страниц ----------
     df_display = pages_df[["id", "title"]].copy().reset_index(drop=True)
 
     gb = GridOptionsBuilder.from_dataframe(df_display)
@@ -1641,6 +1659,7 @@ def main():
             if (pages_df["id"] == stored_page_id).any():
                 page_id = int(stored_page_id)
 
+    # ---------- Просмотр / редактирование выбранной страницы ----------
     if page_id is not None:
         current_page = pages_df[pages_df["id"] == page_id].iloc[0]
         current_title = current_page.get("title", "")
@@ -1651,6 +1670,7 @@ def main():
         dept_name_for_page = department_map.get(dept_id_for_page, "") if dept_id_for_page else ""
         dept_prefix = f"[{dept_name_for_page}] " if dept_name_for_page else ""
 
+        # ======= строка: информация о странице (слева) + кнопка "Скопировать" (справа) =======
         safe_title = current_title or f"Страница_{page_id}"
         info_left, info_right = st.columns([12, 3])
         with info_left:
@@ -1665,7 +1685,7 @@ def main():
             sql_text = _sql_text_from_html(current_html or "", safe_title)
             render_copy_sql_button(sql_text, btn_key=f"copy_sql_utf8_{page_id}")
 
-        # ✅ По твоему требованию: без дополнительной санитизации на показе
+
         preview_html = f"""
         <style>
         .page-preview-wrapper {{
@@ -1734,6 +1754,8 @@ def main():
                 key=f"dlg_quill_{page_id_local}",
             )
 
+            # st_quill иногда возвращает None (например, без изменений) — в этом случае
+            # сохраняем исходный HTML, иначе можно случайно затереть контент.
             quill_html = editable_html if quill_value is None else (quill_value or "")
 
             c1, c2 = st.columns([1, 1])
@@ -1754,7 +1776,6 @@ def main():
         dlg_pid = st.session_state.get("edit_dialog_page_id")
         if can_edit_notebook and dlg_pid == page_id:
             edit_page_dialog(page_id, current_title, current_html, current_tag)
-
 
         # --- кнопка редактирования + экспорт + вложения + перемещение ---
         col1, col2, col3, col4 = st.columns([1.5, 1.5, 3, 3])
@@ -2130,6 +2151,6 @@ def main():
             st.info("У вас права только на просмотр этой записной книжки.")
 
 
-
 if __name__ == "__main__":
     main()
+
