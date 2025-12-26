@@ -1257,7 +1257,7 @@ def main():
     st.markdown(
         """
         <style>
-        [data-testid="stSidebar"] { min-width: 330px; }
+        [data-testid="stSidebar"] { min-width: 350px; }
         </style>
         """,
         unsafe_allow_html=True,
@@ -1690,13 +1690,31 @@ def main():
             st.session_state["edit_dialog_page_id"] = new_page_id
             st.rerun()
 
+
+
+
     # ---------- Список страниц ----------
     df_display = pages_df[["id", "title"]].copy().reset_index(drop=True)
 
     gb = GridOptionsBuilder.from_dataframe(df_display)
+
+    # selection
     gb.configure_selection("single", use_checkbox=False)
-    gb.configure_column("title", header_name="Страница", flex=1, minWidth=160)
-    gb.configure_column("id", header_name="ID", width=60, hide=True)
+
+    # ВАЖНО: id скрыт и не участвует в подгонке ширины
+    gb.configure_column("id", header_name="ID", hide=True, suppressSizeToFit=True)
+
+    # Единственная видимая колонка — растягиваем на всю ширину
+    gb.configure_column(
+        "title",
+        header_name="Страница",
+        flex=1,          # заполняет всё доступное
+        minWidth=160,
+        resizable=True,
+    )
+
+    # (опционально) defaultColDef — на всякий случай
+    gb.configure_default_column(resizable=True)
 
     force_page_id = st.session_state.pop("force_page_id", None)
     if force_page_id is not None and not df_display.empty:
@@ -1706,12 +1724,41 @@ def main():
         except Exception:
             pass
 
+    # JS: растянуть колонку на ширину грида (и при первом рендере, и при resize окна)
+    on_grid_ready = JsCode(
+        """
+        function(params) {
+            try { params.api.sizeColumnsToFit(); } catch(e) {}
+
+            // на всякий случай после отрисовки (иногда Streamlit/Sidebar меняют размеры позже)
+            setTimeout(function(){ try { params.api.sizeColumnsToFit(); } catch(e) {} }, 50);
+            setTimeout(function(){ try { params.api.sizeColumnsToFit(); } catch(e) {} }, 200);
+
+            // при ресайзе окна
+            if (!window.__notes_pages_resize_bound) {
+                window.__notes_pages_resize_bound = true;
+                window.addEventListener('resize', function() {
+                    try { params.api.sizeColumnsToFit(); } catch(e) {}
+                });
+            }
+        }
+        """
+    )
+
+    on_first_data_rendered = JsCode(
+        """
+        function(params) {
+            try { params.api.sizeColumnsToFit(); } catch(e) {}
+        }
+        """
+    )
+
+    gb.configure_grid_options(
+        onGridReady=on_grid_ready,
+        onFirstDataRendered=on_first_data_rendered,
+    )
+
     list_container = st.sidebar.container()
-
-    on_grid_ready = JsCode("function(params) { params.api.sizeColumnsToFit(); }")
-    on_grid_size_changed = JsCode("function(params) { params.api.sizeColumnsToFit(); }")
-    gb.configure_grid_options(onGridReady=on_grid_ready, onGridSizeChanged=on_grid_size_changed)
-
     with list_container:
         grid_response = AgGrid(
             df_display,
@@ -1719,24 +1766,33 @@ def main():
             enable_enterprise_modules=False,
             update_on=["selectionChanged"],
             height=650,
-            fit_columns_on_grid_load=False,
+            fit_columns_on_grid_load=True,   # ✅ ключевой фикс: колонка "Страница" = вся ширина грида
             allow_unsafe_jscode=True,
         )
+
+    # --- выбор страницы из грида (ОБЯЗАТЕЛЬНО объявляем page_id заранее) ---
+    page_id: int | None = None
 
     selected_rows = grid_response.get("selected_rows", [])
     if isinstance(selected_rows, pd.DataFrame):
         selected_rows = selected_rows.to_dict("records")
 
-    page_id: int | None = None
     if selected_rows:
         row = selected_rows[0]
-        page_id = int(row["id"])
-        st.session_state["current_page_id"] = page_id
+        try:
+            page_id = int(row["id"])
+            st.session_state["current_page_id"] = page_id
+        except Exception:
+            page_id = None
     else:
         stored_page_id = st.session_state.get("current_page_id")
         if stored_page_id is not None and not pages_df.empty:
-            if (pages_df["id"] == stored_page_id).any():
+            if (pages_df["id"].astype(int) == int(stored_page_id)).any():
                 page_id = int(stored_page_id)
+
+
+
+
 
     # ---------- Просмотр / редактирование выбранной страницы ----------
     if page_id is not None:
@@ -1821,7 +1877,10 @@ def main():
             with col_l:
                 new_title = st.text_input("Название страницы", value=title, key=f"dlg_title_{page_id_local}")
             with col_r:
-                new_tag = st.text_input("Теги", value=tag or "", key=f"dlg_tag_{page_id_local}")
+                new_tag = st.text_input("Теги", 
+                                            value=tag or "", 
+                                            key=f"dlg_tag_{page_id_local}",
+                                            placeholder="Введите тег(и) через запятую без символа #",)
 
             editable_html = html_body or ""
 
@@ -2304,3 +2363,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
