@@ -1263,6 +1263,9 @@ def main():
         unsafe_allow_html=True,
     )
 
+
+
+
     ensure_db_credentials()
     owned_notebooks_df = pd.DataFrame()
 
@@ -1862,8 +1865,18 @@ def main():
             else:
                 st.caption("Просмотр (редактирование недоступно)")
 
+
+
         with col2:
-            with st.expander("Экспорт", expanded=False):
+            exp_export_nonce_key = f"exp_export_nonce_{page_id}"
+            st.session_state.setdefault(exp_export_nonce_key, 0)
+
+            def _collapse_export():
+                st.session_state[exp_export_nonce_key] += 1
+
+            exp_export_label = "Экспорт" + ("\u200b" * int(st.session_state[exp_export_nonce_key]))
+
+            with st.expander(exp_export_label, expanded=False):
                 safe_title = current_title or f"Страница_{page_id}"
 
                 docx_bytes = export_html_to_docx_bytes(current_html, safe_title)
@@ -1872,7 +1885,7 @@ def main():
                     data=docx_bytes,
                     file_name=_safe_filename(safe_title, "docx"),
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    on_click=_close_edit_dialog_state,   # ✅ FIX
+                    on_click=_collapse_export,  # ✅ автосвернуть expander после клика
                 )
 
                 st.download_button(
@@ -1880,7 +1893,7 @@ def main():
                     data=export_html_to_sql_bytes(current_html or "", safe_title, encoding="utf-8"),
                     file_name=_safe_filename(safe_title, "sql"),
                     mime="text/plain; charset=utf-8",
-                    on_click=_close_edit_dialog_state,   # ✅ FIX
+                    on_click=_collapse_export,  # ✅ автосвернуть expander после клика
                 )
 
                 st.download_button(
@@ -1888,54 +1901,103 @@ def main():
                     data=export_html_to_sql_bytes(current_html or "", safe_title, encoding="cp1251"),
                     file_name=_safe_filename(safe_title, "sql"),
                     mime="text/plain; charset=windows-1251",
-                    on_click=_close_edit_dialog_state,   # ✅ FIX
+                    on_click=_collapse_export,  # ✅ автосвернуть expander после клика
                 )
+
+
 
 
         # --- Вложения ---
         with col3:
-            exp_key = f"attachments_expanded_{page_id}"
-            expanded_state = st.session_state.get(exp_key, False)
+            # ---- Состояния на страницу ----
+            exp_nonce_key = f"exp_files_nonce_{page_id}"                  # для принудительного “пересоздания” expander
+            up_nonce_files_key = f"uploader_nonce_files_{page_id}"        # для очистки file_uploader
+            up_nonce_links_key = f"uploader_nonce_links_{page_id}"        # опционально, если захочешь чистить поля ссылок
 
-            with st.expander("Файлы и ссылки", expanded=expanded_state):
+            st.session_state.setdefault(exp_nonce_key, 0)
+            st.session_state.setdefault(up_nonce_files_key, 0)
+            st.session_state.setdefault(up_nonce_links_key, 0)
+
+            # Невидимый суффикс, чтобы Streamlit воспринимал expander как новый
+            # (пользователь этого не видит, но expander “сбросится” в collapsed)
+            exp_label = "Файлы и ссылки" + ("\u200b" * int(st.session_state[exp_nonce_key]))
+
+            with st.expander(exp_label, expanded=False):
                 if can_edit_notebook:
+                    # --- Загрузка файлов ---
+                    uploader_key = f"files_uploader_{page_id}_{st.session_state[up_nonce_files_key]}"
                     uploaded_files = st.file_uploader(
-                        "Прикрепить файлы к странице",
+                        "Загрузить файлы",
+                        type=None,  # или список расширений
                         accept_multiple_files=True,
-                        key=f"page_attachments_{page_id}",
+                        key=uploader_key,
                     )
-                    if uploaded_files and st.button("Сохранить файлы", key=f"btn_save_attachments_{page_id}", use_container_width=True):
-                        saved = 0
-                        errors: list[str] = []
-                        for file in uploaded_files:
-                            try:
-                                save_file_attachment(page_id, file, selected_login)
-                                saved += 1
-                            except Exception as exc:
-                                errors.append(f"{file.name}: {exc}")
-                        if saved:
-                            st.success(f"Прикреплено: {saved}")
-                            st.rerun()
-                        if errors:
-                            st.warning("; ".join(errors))
 
-                    link_title = st.text_input("Подпись для ссылки", key=f"page_link_title_{page_id}")
-                    link_url = st.text_input("URL", key=f"page_link_url_{page_id}")
+                    save_files_clicked = st.button("Сохранить файлы", key=f"save_files_btn_{page_id}")
+
+                    if save_files_clicked:
+                        if not uploaded_files:
+                            st.warning("Сначала выберите файлы для загрузки.")
+                        else:
+                            try:
+                                for uf in uploaded_files:
+                                    save_file_attachment(page_id, uf, selected_login)  # твоя функция
+
+                                st.success(f"Сохранено файлов: {len(uploaded_files)}")
+
+                                # ✅ 1) Очистить file_uploader (меняем key через nonce)
+                                st.session_state[up_nonce_files_key] += 1
+
+                                # ✅ 2) ГАРАНТИРОВАННО свернуть expander:
+                                # пересоздаём его, меняя label невидимым символом
+                                st.session_state[exp_nonce_key] += 1
+
+                                # ✅ 3) Перерисовать UI
+                                st.rerun()
+
+                            except Exception as e:
+                                st.error(f"Ошибка при сохранении файлов: {e}")
+
+                    st.markdown("---")
+
+                    # --- Ссылки ---
+                    link_title_key = f"page_link_title_{page_id}"
+                    link_url_key = f"page_link_url_{page_id}"
+
+                    link_title = st.text_input("Подпись для ссылки", key=link_title_key)
+                    link_url = st.text_input("URL", key=link_url_key)
+
                     if st.button("Сохранить ссылку", key=f"btn_save_link_{page_id}", use_container_width=True):
                         try:
                             save_link_attachment(page_id, link_url, link_title, selected_login)
                             st.success("Ссылка сохранена")
+
+                            # (опционально) если хочешь после сохранения ссылки тоже “схлопывать”:
+                            # st.session_state[exp_nonce_key] += 1
+
                             st.rerun()
                         except ValueError as exc:
                             st.warning(str(exc))
                         except Exception as exc:
                             st.error(f"Не удалось сохранить ссылку: {exc}")
+
                 else:
                     st.caption("Прикреплять файлы могут совладельцы блокнота.")
 
+
+
+
         # --- Перемещение/копирование ---
         with col4:
-            with st.expander("Переместить или скопировать", expanded=False):
+            exp_move_nonce_key = f"exp_move_nonce_{page_id}"
+            st.session_state.setdefault(exp_move_nonce_key, 0)
+
+            def _collapse_move():
+                st.session_state[exp_move_nonce_key] += 1
+
+            exp_move_label = "Переместить или скопировать" + ("\u200b" * int(st.session_state[exp_move_nonce_key]))
+
+            with st.expander(exp_move_label, expanded=False):
                 st.write(f"Текущая страница: **{current_title or f'ID {page_id}'}**")
 
                 if owned_notebooks_df.empty:
@@ -1974,11 +2036,16 @@ def main():
 
                         col_move, col_copy, col_cancel = st.columns(3)
 
-                        move_clicked = False
                         with col_move:
                             if can_edit_notebook:
-                                move_clicked = st.button("Переместить", type="primary", key=f"btn_move_{page_id}", use_container_width=True)
+                                move_clicked = st.button(
+                                    "Переместить",
+                                    type="primary",
+                                    key=f"btn_move_{page_id}",
+                                    use_container_width=True,
+                                )
                             else:
+                                move_clicked = False
                                 st.caption("Перемещение недоступно\n(только владельцы книги)")
 
                         with col_copy:
@@ -1998,6 +2065,8 @@ def main():
                             st.success("Страница перемещена.")
                             st.session_state["current_page_id"] = page_id
                             st.session_state["force_page_id"] = page_id
+
+                            _collapse_move()  # ✅ автосвернуть expander
                             st.rerun()
 
                         if copy_clicked:
@@ -2007,10 +2076,10 @@ def main():
                                     (section_id, title, tag, body_html, created_by)
                                 VALUES
                                     ({int(dest_section.id)},
-                                     '{_escape(current_title)}',
-                                     '{_escape(current_tag)}',
-                                     '{_escape(current_html)}',
-                                     '{_escape(selected_login)}')
+                                    '{_escape(current_title)}',
+                                    '{_escape(current_tag)}',
+                                    '{_escape(current_html)}',
+                                    '{_escape(selected_login)}')
                                 RETURNING id
                                 """
                             )
@@ -2022,10 +2091,16 @@ def main():
                                 st.session_state["current_page_id"] = new_page_id
                                 st.session_state["force_page_id"] = new_page_id
                                 st.session_state["force_edit_page_id"] = new_page_id
+
+                                _collapse_move()  # ✅ автосвернуть expander
                                 st.rerun()
 
                         if cancel_clicked:
+                            _collapse_move()  # ✅ автосвернуть expander
                             st.rerun()
+
+
+
 
         # --- таблица вложений ---
         attachments_df = get_page_attachments(page_id)
@@ -2224,7 +2299,7 @@ def main():
         else:
             st.info("У вас права только на просмотр этой записной книжки.")
 
-
+    st.logo("assets/logo.png",size="medium")
 
 
 if __name__ == "__main__":
