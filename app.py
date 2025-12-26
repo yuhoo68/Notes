@@ -2040,6 +2040,8 @@ def main():
                         try:
                             save_link_attachment(page_id, link_url, link_title, selected_login)
                             st.success("Ссылка сохранена")
+                            # ✅ гарантированно свернуть expander (пересоздать label)
+                            st.session_state[exp_nonce_key] += 1                            
                             st.rerun()
                         except ValueError as exc:
                             st.warning(str(exc))
