@@ -290,6 +290,7 @@ st.session_state.setdefault("edit_dialog_page_id", None)
 st.session_state.setdefault("download_payload", None)  # tuple[bytes, str, str] | None
 st.session_state.setdefault("download_att_id", None)  # int | None
 st.session_state.setdefault("download_error", None)  # str | None
+st.session_state.setdefault("open_editor_once_for_page", None)  # int|None
 
 
 def _creds() -> tuple[str, str]:
@@ -1234,7 +1235,11 @@ def render_copy_sql_button(sql_text: str, btn_key: str) -> None:
 
 
 def _close_edit_dialog_state():
+    # закрыть редактор и убрать любые "авто-открывалки"
     st.session_state["edit_dialog_page_id"] = None
+    st.session_state.pop("force_edit_page_id", None)
+    st.session_state.pop("force_edit_page_id_once", None)
+
 
 
 def main():
@@ -1686,9 +1691,11 @@ def main():
             new_page_id = create_page(section_id=selected_section_id, user_login=selected_login, title=None)
             st.session_state["current_page_id"] = new_page_id
             st.session_state["force_page_id"] = new_page_id
-            st.session_state["force_edit_page_id"] = new_page_id
-            st.session_state["edit_dialog_page_id"] = new_page_id
+            # ✅ открыть редактор ровно один раз на следующем ререндере
+            st.session_state["open_editor_once_for_page"] = new_page_id
             st.rerun()
+
+
 
 
 
@@ -1765,7 +1772,7 @@ def main():
             gridOptions=gb.build(),
             enable_enterprise_modules=False,
             update_on=["selectionChanged"],
-            height=650,
+            height=750,
             fit_columns_on_grid_load=True,   # ✅ ключевой фикс: колонка "Страница" = вся ширина грида
             allow_unsafe_jscode=True,
         )
@@ -1789,6 +1796,9 @@ def main():
         if stored_page_id is not None and not pages_df.empty:
             if (pages_df["id"].astype(int) == int(stored_page_id)).any():
                 page_id = int(stored_page_id)
+
+
+
 
 
 
@@ -1849,6 +1859,7 @@ def main():
         """
         components.html(preview_html, height=600, scrolling=True)
 
+        # ---------------- Диалог редактирования (вызываем ТОЛЬКО по явному действию) ----------------
         @st.dialog("Редактирование страницы", width="large")
         def edit_page_dialog(page_id_local: int, title: str, html_body: str, tag: str):
             st.markdown(
@@ -1868,6 +1879,11 @@ def main():
                 div[data-testid="stDialog"] .ql-editor{
                     min-height: 60vh !important;
                 }
+
+                /* (опционально) скрыть крестик закрытия, чтобы не оставлять "висячие" состояния */
+                div[data-testid="stDialog"] button[aria-label="Close"]{
+                    display: none !important;
+                }
                 </style>
                 """,
                 unsafe_allow_html=True,
@@ -1877,10 +1893,12 @@ def main():
             with col_l:
                 new_title = st.text_input("Название страницы", value=title, key=f"dlg_title_{page_id_local}")
             with col_r:
-                new_tag = st.text_input("Теги", 
-                                            value=tag or "", 
-                                            key=f"dlg_tag_{page_id_local}",
-                                            placeholder="Введите тег(и) через запятую без символа #",)
+                new_tag = st.text_input(
+                    "Теги",
+                    value=tag or "",
+                    key=f"dlg_tag_{page_id_local}",
+                    placeholder="Введите тег(и) через запятую без символа #",
+                )
 
             editable_html = html_body or ""
 
@@ -1898,34 +1916,38 @@ def main():
                 if st.button("Сохранить", key=f"dlg_save_{page_id_local}", use_container_width=True):
                     update_page(page_id_local, new_title, quill_html, new_tag)
                     st.success("Страница обновлена")
-                    st.session_state["edit_dialog_page_id"] = None
+
+                    # ✅ закрыть редактор и убрать любые авто-открывалки
+                    _close_edit_dialog_state()
+
                     st.session_state["current_page_id"] = page_id_local
                     st.session_state["force_page_id"] = page_id_local
                     st.rerun()
 
             with c2:
                 if st.button("Отмена", key=f"dlg_cancel_{page_id_local}", use_container_width=True):
-                    st.session_state["edit_dialog_page_id"] = None
+                    _close_edit_dialog_state()
                     st.rerun()
 
-        dlg_pid = st.session_state.get("edit_dialog_page_id")
-        if can_edit_notebook and dlg_pid == page_id:
+        # ✅ one-shot авто-открытие редактора (после создания/копирования), НЕ будет открываться после открытия вложений
+        st.session_state.setdefault("open_editor_once_for_page", None)
+        open_once = st.session_state.pop("open_editor_once_for_page", None)
+        if can_edit_notebook and open_once == page_id:
             edit_page_dialog(page_id, current_title, current_html, current_tag)
-
 
         # --- кнопка редактирования + экспорт + вложения + перемещение ---
         col1, col2, col3, col4 = st.columns([1.5, 1.5, 3, 3])
 
+        # ---------------- Редактировать ----------------
         with col1:
             if can_edit_notebook:
                 if st.button("Редактировать страницу", key=f"open_edit_dialog_{page_id}", use_container_width=True):
-                    st.session_state["edit_dialog_page_id"] = page_id
-                    st.rerun()
+                    # ✅ открываем диалог напрямую (без session_state-сторожа)
+                    edit_page_dialog(page_id, current_title, current_html, current_tag)
             else:
                 st.caption("Просмотр (редактирование недоступно)")
 
-
-
+        # ---------------- Экспорт ----------------
         with col2:
             exp_export_nonce_key = f"exp_export_nonce_{page_id}"
             st.session_state.setdefault(exp_export_nonce_key, 0)
@@ -1936,58 +1958,51 @@ def main():
             exp_export_label = "Экспорт" + ("\u200b" * int(st.session_state[exp_export_nonce_key]))
 
             with st.expander(exp_export_label, expanded=False):
-                safe_title = current_title or f"Страница_{page_id}"
+                safe_title2 = current_title or f"Страница_{page_id}"
 
-                docx_bytes = export_html_to_docx_bytes(current_html, safe_title)
+                docx_bytes = export_html_to_docx_bytes(current_html, safe_title2)
                 st.download_button(
                     ".docx",
                     data=docx_bytes,
-                    file_name=_safe_filename(safe_title, "docx"),
+                    file_name=_safe_filename(safe_title2, "docx"),
                     mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-                    on_click=_collapse_export,  # ✅ автосвернуть expander после клика
+                    on_click=_collapse_export,
                 )
 
                 st.download_button(
                     ".sql (utf-8)",
-                    data=export_html_to_sql_bytes(current_html or "", safe_title, encoding="utf-8"),
-                    file_name=_safe_filename(safe_title, "sql"),
+                    data=export_html_to_sql_bytes(current_html or "", safe_title2, encoding="utf-8"),
+                    file_name=_safe_filename(safe_title2, "sql"),
                     mime="text/plain; charset=utf-8",
-                    on_click=_collapse_export,  # ✅ автосвернуть expander после клика
+                    on_click=_collapse_export,
                 )
 
                 st.download_button(
                     ".sql (cp1251)",
-                    data=export_html_to_sql_bytes(current_html or "", safe_title, encoding="cp1251"),
-                    file_name=_safe_filename(safe_title, "sql"),
+                    data=export_html_to_sql_bytes(current_html or "", safe_title2, encoding="cp1251"),
+                    file_name=_safe_filename(safe_title2, "sql"),
                     mime="text/plain; charset=windows-1251",
-                    on_click=_collapse_export,  # ✅ автосвернуть expander после клика
+                    on_click=_collapse_export,
                 )
 
-
-
-
-        # --- Вложения ---
+        # ---------------- Вложения ----------------
         with col3:
-            # ---- Состояния на страницу ----
-            exp_nonce_key = f"exp_files_nonce_{page_id}"                  # для принудительного “пересоздания” expander
-            up_nonce_files_key = f"uploader_nonce_files_{page_id}"        # для очистки file_uploader
-            up_nonce_links_key = f"uploader_nonce_links_{page_id}"        # опционально, если захочешь чистить поля ссылок
+            exp_nonce_key = f"exp_files_nonce_{page_id}"
+            up_nonce_files_key = f"uploader_nonce_files_{page_id}"
+            up_nonce_links_key = f"uploader_nonce_links_{page_id}"
 
             st.session_state.setdefault(exp_nonce_key, 0)
             st.session_state.setdefault(up_nonce_files_key, 0)
             st.session_state.setdefault(up_nonce_links_key, 0)
 
-            # Невидимый суффикс, чтобы Streamlit воспринимал expander как новый
-            # (пользователь этого не видит, но expander “сбросится” в collapsed)
             exp_label = "Файлы и ссылки" + ("\u200b" * int(st.session_state[exp_nonce_key]))
 
             with st.expander(exp_label, expanded=False):
                 if can_edit_notebook:
-                    # --- Загрузка файлов ---
                     uploader_key = f"files_uploader_{page_id}_{st.session_state[up_nonce_files_key]}"
                     uploaded_files = st.file_uploader(
                         "Загрузить файлы",
-                        type=None,  # или список расширений
+                        type=None,
                         accept_multiple_files=True,
                         key=uploader_key,
                     )
@@ -2000,26 +2015,21 @@ def main():
                         else:
                             try:
                                 for uf in uploaded_files:
-                                    save_file_attachment(page_id, uf, selected_login)  # твоя функция
+                                    save_file_attachment(page_id, uf, selected_login)
 
                                 st.success(f"Сохранено файлов: {len(uploaded_files)}")
 
-                                # ✅ 1) Очистить file_uploader (меняем key через nonce)
+                                # ✅ очистить file_uploader
                                 st.session_state[up_nonce_files_key] += 1
-
-                                # ✅ 2) ГАРАНТИРОВАННО свернуть expander:
-                                # пересоздаём его, меняя label невидимым символом
+                                # ✅ гарантированно свернуть expander (пересоздать label)
                                 st.session_state[exp_nonce_key] += 1
 
-                                # ✅ 3) Перерисовать UI
                                 st.rerun()
-
                             except Exception as e:
                                 st.error(f"Ошибка при сохранении файлов: {e}")
 
                     st.markdown("---")
 
-                    # --- Ссылки ---
                     link_title_key = f"page_link_title_{page_id}"
                     link_url_key = f"page_link_url_{page_id}"
 
@@ -2030,23 +2040,15 @@ def main():
                         try:
                             save_link_attachment(page_id, link_url, link_title, selected_login)
                             st.success("Ссылка сохранена")
-
-                            # (опционально) если хочешь после сохранения ссылки тоже “схлопывать”:
-                            # st.session_state[exp_nonce_key] += 1
-
                             st.rerun()
                         except ValueError as exc:
                             st.warning(str(exc))
                         except Exception as exc:
                             st.error(f"Не удалось сохранить ссылку: {exc}")
-
                 else:
                     st.caption("Прикреплять файлы могут совладельцы блокнота.")
 
-
-
-
-        # --- Перемещение/копирование ---
+        # ---------------- Переместить/скопировать ----------------
         with col4:
             exp_move_nonce_key = f"exp_move_nonce_{page_id}"
             st.session_state.setdefault(exp_move_nonce_key, 0)
@@ -2125,7 +2127,7 @@ def main():
                             st.session_state["current_page_id"] = page_id
                             st.session_state["force_page_id"] = page_id
 
-                            _collapse_move()  # ✅ автосвернуть expander
+                            _collapse_move()
                             st.rerun()
 
                         if copy_clicked:
@@ -2149,14 +2151,18 @@ def main():
                                 st.success("Страница скопирована.")
                                 st.session_state["current_page_id"] = new_page_id
                                 st.session_state["force_page_id"] = new_page_id
-                                st.session_state["force_edit_page_id"] = new_page_id
 
-                                _collapse_move()  # ✅ автосвернуть expander
+                                # ✅ если нужно открыть редактор после копирования — one-shot
+                                st.session_state["open_editor_once_for_page"] = new_page_id
+
+                                _collapse_move()
                                 st.rerun()
 
                         if cancel_clicked:
-                            _collapse_move()  # ✅ автосвернуть expander
+                            _collapse_move()
                             st.rerun()
+
+        # --- дальше у тебя идёт таблица вложений, удаление страницы и т.д. ---
 
 
 
