@@ -4,6 +4,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 import subprocess
 import sys
+import tempfile
 
 # if "reqs_installed" not in st.session_state:
 #     req_path = os.path.join(os.path.dirname(__file__), "requirements.txt")
@@ -23,6 +24,7 @@ import io
 import json
 import re
 import urllib.parse
+import datetime
 from typing import Optional
 
 import pandas as pd
@@ -32,6 +34,7 @@ from docx import Document
 from docx.enum.text import WD_LINE_SPACING
 from docx.shared import Inches, Pt
 from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
+from st_aggrid.shared import GridUpdateMode, DataReturnMode
 from streamlit_quill import st_quill
 
 # ---- XSS sanitize (bleach optional) ----
@@ -45,7 +48,7 @@ except Exception:
 
 import config
 from src.database_utils_DRP import get_execute, get_fetch, test_connection
-
+from src.mail import send_mail
 
 SCHEMA = "sbx_dfip_ocpp"
 USERS_TABLE = f"{SCHEMA}.notes_users"
@@ -55,6 +58,7 @@ PAGES_TABLE = f"{SCHEMA}.notes_pages"
 OWNERS_TABLE = f"{SCHEMA}.notes_notebook_owners"
 DEPARTMENTS_TABLE = f"{SCHEMA}.notes_departments"
 ATTACHMENTS_TABLE = f"{SCHEMA}.notes_page_attachments"
+EMAIL_RECIPIENTS_TABLE = f"{SCHEMA}.notes_email_recipients"
 
 
 logging.basicConfig(
@@ -67,6 +71,267 @@ logger = logging.getLogger("notes_app")
 def _escape(val: str) -> str:
     """Минимальное экранирование строк для SQL."""
     return (val or "").replace("'", "''")
+
+
+
+def _escape_like(val: str) -> str:
+    """
+    Экранируем спецсимволы для ILIKE-шаблонов (% и _), чтобы пользователь
+    не мог ломать шаблон. Используем ESCAPE '\\' в SQL.
+    """
+    s = (val or "")
+    s = s.replace("\\", "\\\\")
+    s = s.replace("%", "\\%")
+    s = s.replace("_", "\\_")
+    return _escape(s)
+
+
+# -------------------------
+# Advanced search parser (Google-like)
+# -------------------------
+class _Tok:
+    def __init__(self, typ: str, val: str = ""):
+        self.typ = typ  # WORD, PHRASE, LPAREN, RPAREN, OR, PLUS, MINUS
+        self.val = val
+
+
+def _lex_search(q: str) -> list[_Tok]:
+    """
+    Лексер:
+      - "фраза" -> PHRASE(val)
+      - ( )     -> LPAREN/RPAREN
+      - |       -> OR
+      - +       -> PLUS (унарный)
+      - -       -> MINUS (унарный)
+      - остальное -> WORD (может содержать '*')
+    """
+    s = (q or "").strip()
+    out: list[_Tok] = []
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+
+        if ch.isspace():
+            i += 1
+            continue
+
+        if ch == '"':
+            i += 1
+            buf = []
+            while i < n and s[i] != '"':
+                buf.append(s[i])
+                i += 1
+            if i < n and s[i] == '"':
+                i += 1
+            phrase = "".join(buf).strip()
+            if phrase:
+                out.append(_Tok("PHRASE", phrase))
+            continue
+
+        if ch == "(":
+            out.append(_Tok("LPAREN", ch))
+            i += 1
+            continue
+        if ch == ")":
+            out.append(_Tok("RPAREN", ch))
+            i += 1
+            continue
+        if ch == "|":
+            out.append(_Tok("OR", ch))
+            i += 1
+            continue
+        if ch == "+":
+            out.append(_Tok("PLUS", ch))
+            i += 1
+            continue
+        if ch == "-":
+            out.append(_Tok("MINUS", ch))
+            i += 1
+            continue
+
+        # WORD
+        buf = []
+        while i < n:
+            ch2 = s[i]
+            if ch2.isspace() or ch2 in ['"', "(", ")", "|"]:
+                break
+            # + и - считаем частью слова, если они НЕ в начале токена
+            if ch2 in ["+", "-"] and not buf:
+                break
+            buf.append(ch2)
+            i += 1
+        word = "".join(buf).strip()
+        if word:
+            out.append(_Tok("WORD", word))
+        else:
+            # если упёрлись в + / - в начале — обработаем как оператор
+            if i < n and s[i] == "+":
+                out.append(_Tok("PLUS", "+"))
+                i += 1
+            elif i < n and s[i] == "-":
+                out.append(_Tok("MINUS", "-"))
+                i += 1
+            else:
+                i += 1
+
+    return out
+
+
+def _fields_like_expr_text(like_pattern_sql: str) -> str:
+    # В Postgres ESCAPE должен быть пустым или состоять из ОДНОГО байта.
+    # Надёжный вариант: ESCAPE E'\\' (это ровно один символ backslash).
+    esc = " ESCAPE E'\\\\' "
+    return (
+        f"(COALESCE(p.title, '') ILIKE {like_pattern_sql}{esc}"
+        f"OR COALESCE(p.body_html, '') ILIKE {like_pattern_sql}{esc})"
+    )
+
+
+def _fields_like_expr_tags(like_pattern_sql: str) -> str:
+    esc = " ESCAPE E'\\\\' "
+    return f"(COALESCE(p.tag, '') ILIKE {like_pattern_sql}{esc})"
+
+
+
+def _term_to_sql(tok: _Tok, mode: str = "text") -> str:
+    """
+    WORD / PHRASE -> SQL expr.
+    WORD: поддержка wildcard '*' -> '%'
+
+    mode:
+      - "text": поиск по title/body_html
+      - "tags": поиск по p.tag
+    """
+    def _fields_expr(pat_sql: str) -> str:
+        return _fields_like_expr_tags(pat_sql) if mode == "tags" else _fields_like_expr_text(pat_sql)
+
+    if tok.typ == "PHRASE":
+        pat = f"'%{_escape_like(tok.val)}%'"
+        return _fields_expr(pat)
+
+    if tok.typ == "WORD":
+        w = tok.val.strip()
+        if not w:
+            return "TRUE"
+
+        if "*" in w:
+            # '*' разрешаем как wildcard. В _escape_like '*' не экранируется, но на всякий случай:
+            safe = _escape_like(w).replace("\\*", "*")
+            safe = safe.replace("*", "%")
+            if not safe.startswith("%"):
+                safe = "%" + safe
+            if not safe.endswith("%"):
+                safe = safe + "%"
+            return _fields_expr(f"'{safe}'")
+
+        pat = f"'%{_escape_like(w)}%'"
+        return _fields_expr(pat)
+
+    return "TRUE"
+
+
+
+class _Parser:
+    """
+    Грамматика (OR ниже AND, как Google):
+      expr     := or_expr
+      or_expr  := and_expr (OR and_expr)*
+      and_expr := unary (unary)*            # неявный AND по соседству
+      unary    := (PLUS|MINUS)* primary
+      primary  := TERM | '(' expr ')'
+      TERM     := WORD | PHRASE
+    """
+    def __init__(self, toks: list[_Tok], term_sql_func):
+        self.toks = toks
+        self.i = 0
+        self.term_sql_func = term_sql_func  # TERM -> SQL
+
+    def _peek(self) -> _Tok | None:
+        return self.toks[self.i] if self.i < len(self.toks) else None
+
+    def _eat(self, typ: str) -> _Tok | None:
+        t = self._peek()
+        if t and t.typ == typ:
+            self.i += 1
+            return t
+        return None
+
+    def parse(self) -> str:
+        if not self.toks:
+            return ""
+        return self._parse_or()
+
+    def _parse_or(self) -> str:
+        left = self._parse_and()
+        while self._eat("OR"):
+            right = self._parse_and()
+            left = f"({left} OR {right})"
+        return left
+
+    def _starts_unary_or_primary(self, t: _Tok | None) -> bool:
+        return bool(t and t.typ in ("PLUS", "MINUS", "WORD", "PHRASE", "LPAREN"))
+
+    def _parse_and(self) -> str:
+        left = self._parse_unary()
+        while True:
+            t = self._peek()
+            if not self._starts_unary_or_primary(t):
+                break
+            if t and t.typ in ("RPAREN", "OR"):
+                break
+            right = self._parse_unary()
+            left = f"({left} AND {right})"
+        return left
+
+    def _parse_unary(self) -> str:
+        neg = False
+        while True:
+            if self._eat("PLUS"):
+                continue
+            if self._eat("MINUS"):
+                neg = not neg
+                continue
+            break
+
+        prim = self._parse_primary()
+        return f"(NOT {prim})" if neg else prim
+
+    def _parse_primary(self) -> str:
+        if self._eat("LPAREN"):
+            inside = self._parse_or()
+            self._eat("RPAREN")
+            return f"({inside})"
+
+        t = self._peek()
+        if t and t.typ in ("WORD", "PHRASE"):
+            self.i += 1
+            return self.term_sql_func(t)
+
+        if t:
+            self.i += 1
+        return "TRUE"
+
+
+
+
+
+def build_advanced_search_where(search_raw: str, mode: str = "text") -> str:
+    toks = _lex_search(search_raw)
+    if not toks:
+        return ""
+
+    def _term_func(t: _Tok) -> str:
+        return _term_to_sql(t, mode=mode)
+
+    parser = _Parser(toks, term_sql_func=_term_func)
+    expr_sql = parser.parse().strip()
+    if not expr_sql:
+        return ""
+    return " AND " + expr_sql
+
+
+
 
 
 # =========================
@@ -256,6 +521,105 @@ def _format_file_size(size: int | float | None) -> str:
     return f"{value:.1f} B"
 
 
+def _parse_email_list(raw: str) -> list[str]:
+    parts = re.split(r"[,;\s]+", raw or "")
+    out: list[str] = []
+    for part in parts:
+        item = part.strip()
+        if item:
+            out.append(item)
+    return out
+
+
+def _parse_path_list(raw: str) -> list[str]:
+    parts = re.split(r"[;,\n]+", raw or "")
+    out: list[str] = []
+    for part in parts:
+        item = part.strip()
+        if item:
+            out.append(item)
+    return out
+
+
+def _merge_email_lists(*lists: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for items in lists:
+        for item in items:
+            if not item or item in seen:
+                continue
+            seen.add(item)
+            out.append(item)
+    return out
+
+
+def _is_valid_email(value: str) -> bool:
+    val = (value or "").strip()
+    if not val:
+        return False
+    return re.match(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$", val) is not None
+
+
+def _sanitize_attachment_filename(name: str) -> str:
+    base = os.path.basename(name or "attachment")
+    base = _transliterate_ru_filename(base)
+    base = re.sub(r"[^A-Za-z0-9_.-]+", "_", base)
+    base = re.sub(r"_+", "_", base).strip("._- ")
+    return base or "attachment"
+
+
+def _transliterate_ru_filename(text: str) -> str:
+    if not text:
+        return ""
+
+    m = {
+        "а": "a",
+        "б": "b",
+        "в": "v",
+        "г": "g",
+        "д": "d",
+        "е": "e",
+        "ё": "yo",
+        "ж": "zh",
+        "з": "z",
+        "и": "i",
+        "й": "y",
+        "к": "k",
+        "л": "l",
+        "м": "m",
+        "н": "n",
+        "о": "o",
+        "п": "p",
+        "р": "r",
+        "с": "s",
+        "т": "t",
+        "у": "u",
+        "ф": "f",
+        "х": "kh",
+        "ц": "ts",
+        "ч": "ch",
+        "ш": "sh",
+        "щ": "shch",
+        "ъ": "",
+        "ы": "y",
+        "ь": "",
+        "э": "e",
+        "ю": "yu",
+        "я": "ya",
+    }
+    out: list[str] = []
+    for ch in text:
+        low = ch.lower()
+        if low in m:
+            rep = m[low]
+            if ch.isupper() and rep:
+                rep = rep[0].upper() + rep[1:]
+            out.append(rep)
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def ensure_db_credentials() -> dict[str, str]:
     """Запрос логина/пароля к БД один раз за сессию."""
     creds = st.session_state.get("db_credentials")
@@ -286,11 +650,37 @@ def ensure_db_credentials() -> dict[str, str]:
     st.stop()
 
 
+def cleanup_docs_dir() -> None:
+    base_dir = os.path.dirname(__file__)
+    docs_dir = os.path.join(base_dir, config.temp_attachments_dir)
+    if not os.path.isdir(docs_dir):
+        return
+
+    today = datetime.date.today()
+    for name in os.listdir(docs_dir):
+        if name in ("__init__", "__init__.py"):
+            continue
+        path = os.path.join(docs_dir, name)
+        if not os.path.isfile(path):
+            continue
+        try:
+            mtime = datetime.date.fromtimestamp(os.path.getmtime(path))
+        except OSError:
+            continue
+        if mtime < today:
+            try:
+                os.remove(path)
+                logger.info("Удален устаревший файл: %s", path)
+            except OSError as exc:
+                logger.warning("Не удалось удалить файл %s: %s", path, exc)
+
+
 st.session_state.setdefault("edit_dialog_page_id", None)
 st.session_state.setdefault("download_payload", None)  # tuple[bytes, str, str] | None
 st.session_state.setdefault("download_att_id", None)  # int | None
 st.session_state.setdefault("download_error", None)  # str | None
 st.session_state.setdefault("open_editor_once_for_page", None)  # int|None
+st.session_state.setdefault("email_dialog_page_id", None)  # int | None
 
 
 def _creds() -> tuple[str, str]:
@@ -300,7 +690,16 @@ def _creds() -> tuple[str, str]:
 
 def run_fetch_df(query: str) -> pd.DataFrame:
     user, pwd = _creds()
-    return get_fetch(query, user, pwd)
+    try:
+        df = get_fetch(query, user, pwd)
+        if df is None:
+            return pd.DataFrame()
+        return df
+    except Exception as e:
+        logger.exception("DB fetch error: %s", e)
+        st.error(f"Ошибка запроса к БД: {e}")
+        return pd.DataFrame()
+
 
 
 def run_execute(query: str) -> int | None:
@@ -321,6 +720,32 @@ def list_users() -> pd.DataFrame:
         SELECT login, full_name, department_id
         FROM {USERS_TABLE}
         ORDER BY COALESCE(full_name, login)
+        """
+    )
+
+
+def get_user_signature(login: str) -> tuple[str, str]:
+    df = run_fetch_df(
+        f"""
+        SELECT full_name, job_title
+        FROM {USERS_TABLE}
+        WHERE login = '{_escape(login)}'
+        LIMIT 1
+        """
+    )
+    if df.empty:
+        return login, ""
+    full_name = str(df.at[0, "full_name"] or "").strip() or login
+    job_title = str(df.at[0, "job_title"] or "").strip()
+    return full_name, job_title
+
+
+def list_email_recipients() -> pd.DataFrame:
+    return run_fetch_df(
+        f"""
+        SELECT email, fio, job_title, salutation
+        FROM {EMAIL_RECIPIENTS_TABLE}
+        ORDER BY COALESCE(fio, email)
         """
     )
 
@@ -511,10 +936,12 @@ def load_pages_df(
     if not allowed_notebook_ids:
         return pd.DataFrame()
 
+    # ✅ ДОБАВИЛИ p.status
     query = f"""
         SELECT
             p.id,
             p.title,
+            p.status,
             p.tag,
             p.body_html,
             p.created_at,
@@ -534,20 +961,30 @@ def load_pages_df(
     allowed_csv = ", ".join(str(int(x)) for x in allowed_notebook_ids)
     query += f" AND n.id IN ({allowed_csv})"
 
-    if notebook_id:
-        query += f" AND n.id = {int(notebook_id)}"
+
     if section_id:
         query += f" AND s.id = {int(section_id)}"
 
+
     if search_text:
         if search_tags_only:
-            query += f" AND p.tag ILIKE '%{_escape(search_text)}%'"
+            # ✅ расширенный поиск (Google-like) по тегам (p.tag)
+            query += build_advanced_search_where(search_text, mode="tags")
         else:
-            q = _escape(search_text)
-            query += f" AND (p.title ILIKE '%{q}%' OR p.body_html ILIKE '%{q}%')"
+            # ✅ расширенный поиск по title/body_html
+            query += build_advanced_search_where(search_text, mode="text")
+
+
+
+
 
     query += " ORDER BY p.updated_at DESC, p.id DESC"
-    return run_fetch_df(query)
+
+    logger.info("PAGES SEARCH SQL:\n%s", query)
+
+    df = run_fetch_df(query)
+    return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+
 
 
 def create_notebook(name: str, user_login: str, department_id: str | None) -> int:
@@ -727,6 +1164,250 @@ def get_attachment_file(attachment_id: int) -> tuple[bytes, str, str] | None:
         pass
 
     return data, file_name, mime_type
+
+
+@st.dialog("Новое сообщение", width="large")
+def email_message_dialog(page_id: int, page_title: str, page_html: str, sender_login: str, page_path: str):
+    recipients_df = list_email_recipients()
+    recipient_options = list(recipients_df.itertuples(index=False)) if not recipients_df.empty else []
+    sender_full_name, sender_job_title = get_user_signature(sender_login)
+
+    def _recipient_label(row) -> str:
+        fio = getattr(row, "fio", "") or ""
+        email_addr = getattr(row, "email", "") or ""
+        job_title = getattr(row, "job_title", "") or ""
+        if fio and email_addr:
+            label = f"{fio} <{email_addr}>"
+        else:
+            label = fio or email_addr
+        if job_title:
+            label = f"{label} ({job_title})"
+        return label
+
+    def _attachment_label(row) -> str:
+        size_txt = _format_file_size(getattr(row, "file_size", None))
+        suffix = f" ({size_txt})" if size_txt else ""
+        return f"{row.file_name}{suffix}"
+
+    attachments_df = get_page_attachments(page_id)
+    file_records = [
+        row for row in attachments_df.itertuples(index=False) if getattr(row, "attachment_type", "") == "file"
+    ]
+    link_records = [
+        row
+        for row in attachments_df.itertuples(index=False)
+        if getattr(row, "attachment_type", "") == "link" and getattr(row, "url", None)
+    ]
+
+    def _build_links_block() -> str:
+        if not link_records:
+            return ""
+        lines = []
+        for row in link_records:
+            title = (getattr(row, "file_name", "") or "").strip()
+            url = (getattr(row, "url", "") or "").strip()
+            if not url:
+                continue
+            if title:
+                lines.append(f"- {title}: {url}")
+            else:
+                lines.append(f"- {url}")
+        if not lines:
+            return ""
+        return "Ссылки:\n" + "\n".join(lines)
+
+    subject_default = page_title or f"Страница {page_id}"
+    body_plain = _html_to_plain_for_email(page_html or "")
+    greeting = "Добрый день!"
+    links_block = _build_links_block()
+    page_info = f"{page_path}".strip()
+    signature = f"С уважением!\n{sender_full_name}\n{sender_job_title}".rstrip()
+
+    body_parts = [greeting]
+    if body_plain:
+        body_parts.append(body_plain)
+    if links_block:
+        body_parts.append(links_block)
+    if page_path:
+        body_parts.append(page_info)
+    body_parts.append(signature)
+    body_default = "\n\n".join(part for part in body_parts if part)
+
+    with st.form(f"email_form_{page_id}", clear_on_submit=False):
+        subject = st.text_input("Тема", value=subject_default)
+
+        if not recipient_options:
+            st.caption("Справочник получателей пуст.")
+
+        to_dir = st.multiselect(
+            "Получатели (справочник)",
+            options=recipient_options,
+            format_func=_recipient_label,
+            key=f"email_to_dir_{page_id}",
+        )
+        cc_dir = st.multiselect(
+            "Копия (справочник)",
+            options=recipient_options,
+            format_func=_recipient_label,
+            key=f"email_cc_dir_{page_id}",
+        )
+
+        bcc_dir = st.multiselect(
+            "Скрытая копия (справочник)",
+            options=recipient_options,
+            format_func=_recipient_label,
+            key=f"email_bcc_dir_{page_id}",
+        )
+
+        body = st.text_area("Тело письма", value=body_default, height=200)
+        important = st.checkbox("Важное", value=False)
+
+        if file_records:
+            selected_files = st.multiselect(
+                "Вложения страницы",
+                options=file_records,
+                format_func=_attachment_label,
+                key=f"email_files_{page_id}",
+            )
+        else:
+            st.caption("Вложения страницы отсутствуют.")
+            selected_files = []
+
+        send_col, cancel_col, add_col = st.columns([1, 1, 2])
+        with send_col:
+            submitted = st.form_submit_button("Отправить")
+        with cancel_col:
+            canceled = st.form_submit_button("Отмена")
+        with add_col:
+            with st.expander("Добавить получателя", expanded=False):
+                new_email = st.text_input("eMail", key=f"email_new_email_{page_id}")
+                new_fio = st.text_input("ФИО", key=f"email_new_fio_{page_id}")
+                new_gender = st.selectbox(
+                    "Пол",
+                    options=["муж", "жен"],
+                    key=f"email_new_gender_{page_id}",
+                )
+                new_job_title = st.text_input("Должность", key=f"email_new_job_title_{page_id}")
+                new_salutation = st.text_input("Как обращаться", key=f"email_new_salutation_{page_id}")
+                add_recipient = st.form_submit_button("Добавить")
+
+    if canceled:
+        st.session_state["email_dialog_page_id"] = None
+        st.rerun()
+    elif add_recipient:
+        email_trim = new_email.strip().lower()
+        fio_trim = new_fio.strip()
+
+        if not email_trim or not fio_trim:
+            st.error("Заполните eMail и ФИО.")
+            return
+
+        if not _is_valid_email(email_trim):
+            st.error("Некорректный формат eMail.")
+            return
+
+        exists = run_scalar(
+            f"""
+            SELECT 1
+            FROM {EMAIL_RECIPIENTS_TABLE}
+            WHERE lower(email) = lower('{_escape(email_trim)}')
+            LIMIT 1
+            """
+        )
+        if exists:
+            st.error("eMail уже существует.")
+            return
+
+        run_execute(
+            f"""
+            INSERT INTO {EMAIL_RECIPIENTS_TABLE}
+                (email, fio, job_title, salutation, gender, created_by)
+            VALUES
+                ('{_escape(email_trim)}',
+                 '{_escape(fio_trim)}',
+                 '{_escape(new_job_title.strip())}',
+                 '{_escape(new_salutation.strip())}',
+                 '{_escape(new_gender)}',
+                 '{_escape(sender_login)}')
+            """
+        )
+        st.success("Получатель добавлен.")
+        st.session_state["email_dialog_page_id"] = page_id
+        st.rerun()
+    elif submitted:
+        to_list = [r.email for r in to_dir if getattr(r, "email", None)]
+        cc_list = [r.email for r in cc_dir if getattr(r, "email", None)]
+        bcc_list = [r.email for r in bcc_dir if getattr(r, "email", None)]
+
+        recipients = _merge_email_lists(to_list)
+        cc = _merge_email_lists(cc_list)
+        bcc = _merge_email_lists(bcc_list)
+
+        if not recipients:
+            st.error("Укажите получателей.")
+            return
+
+        temp_paths: list[str] = []
+        try:
+            base_dir = os.path.dirname(__file__)
+            temp_root = os.path.join(base_dir, config.temp_attachments_dir)
+            os.makedirs(temp_root, exist_ok=True)
+            with tempfile.TemporaryDirectory(prefix="notes_email_", dir=temp_root) as tmpdir:
+                for row in selected_files:
+                    payload = get_attachment_file(int(row.id))
+                    if not payload:
+                        st.warning(
+                            f"Не удалось подгрузить вложение: {row.file_name}"
+                        )
+                        continue
+                    data, file_name, _mime = payload
+                    safe_name = _sanitize_attachment_filename(file_name)
+                    file_path = os.path.join(tmpdir, safe_name)
+                    with open(file_path, "wb") as handle:
+                        handle.write(data)
+                    temp_paths.append(file_path)
+
+                body_text = body or ""
+                if not body_text.strip():
+                    body_text = greeting
+
+                if not body_text.lstrip().startswith(greeting):
+                    body_text = f"{greeting}\n\n{body_text.lstrip()}"
+
+                links_block = _build_links_block()
+                page_info = f"{page_path}".strip()
+                signature = f"С уважением!\n{sender_full_name}\n{sender_job_title}".rstrip()
+
+                if links_block and "Ссылки:" not in body_text:
+                    if "С уважением!" in body_text:
+                        body_text = body_text.replace("С уважением!", f"{links_block}\n\nС уважением!", 1)
+                    else:
+                        body_text = f"{body_text.rstrip()}\n\n{links_block}"
+
+                if page_path and page_info not in body_text:
+                    if "С уважением!" in body_text:
+                        body_text = body_text.replace("С уважением!", f"{page_info}\n\nС уважением!", 1)
+                    else:
+                        body_text = f"{body_text.rstrip()}\n\n{page_info}"
+
+                if "С уважением!" not in body_text:
+                    body_text = f"{body_text.rstrip()}\n\n{signature}"
+
+                send_mail(
+                    subject=subject or "",
+                    recipients=recipients,
+                    cc=cc,
+                    bcc=bcc,
+                    body=body_text,
+                    important=bool(important),
+                    files=temp_paths,
+                )
+
+            st.success("Письмо отправлено.")
+            st.session_state["email_dialog_page_id"] = None
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Ошибка отправки: {exc}")
 
 
 def save_file_attachment(page_id: int, uploaded_file, user_login: str) -> None:
@@ -1093,11 +1774,16 @@ def _html_to_plain_preserving_layout(html: str, indent_spaces: int = 4) -> str:
         return s.replace("\r\n", "\n").replace("\r", "\n")
 
     def _indent_level(tag: Tag) -> int:
-        classes = tag.get("class") or []
-        for c in classes:
-            m = re.match(r"ql-indent-(\d+)", str(c))
-            if m:
-                return int(m.group(1))
+        cur: Tag | None = tag
+        while isinstance(cur, Tag):
+            classes = cur.get("class") or []
+            for c in classes:
+                m = re.match(r"ql-indent-(\d+)", str(c))
+                if m:
+                    return int(m.group(1))
+            if cur is body:
+                break
+            cur = cur.parent if isinstance(cur.parent, Tag) else None
         return 0
 
     def _text_of(tag: Tag) -> str:
@@ -1109,7 +1795,16 @@ def _html_to_plain_preserving_layout(html: str, indent_spaces: int = 4) -> str:
         raw = _norm_newlines(raw).replace("\xa0", " ")
         return "\n".join(line.rstrip() for line in raw.split("\n"))
 
-    blocks = body.find_all(list(block_tags))
+    def _has_desc_block(t: Tag) -> bool:
+        # если внутри есть вложенные блоки, текст контейнера будет дублировать их текст
+        for child in t.find_all(list(block_tags), recursive=True):
+            if child is not t:
+                return True
+        return False
+
+    blocks_all = body.find_all(list(block_tags))
+    # берем "листовые" блоки: те, у которых нет вложенных блоков
+    blocks = [t for t in blocks_all if not _has_desc_block(t)]
     if blocks:
         for el in blocks:
             txt = _text_of(el)
@@ -1129,6 +1824,99 @@ def _html_to_plain_preserving_layout(html: str, indent_spaces: int = 4) -> str:
     else:
         txt = _text_of(body)
         out_lines.extend(txt.split("\n"))
+
+    result = "\n".join(out_lines)
+    result = _norm_newlines(result)
+    result = re.sub(r"\n{3,}", "\n\n", result).rstrip()
+    return result
+
+
+def _html_to_plain_for_email(html: str, indent_spaces: int = 4) -> str:
+    """
+    В отличие от `_html_to_plain_preserving_layout`, нормализует "служебные"
+    переносы/пробелы из HTML (OneNote/Word часто вставляет \\n внутри текста),
+    чтобы в письме не получалось "по слову на строку".
+    """
+    if not html:
+        return ""
+
+    soup = BeautifulSoup(html, "html.parser")
+
+    for bad in soup.find_all(["script", "style"]):
+        bad.decompose()
+
+    br_token = "\u0000"
+    for br in soup.find_all("br"):
+        br.replace_with(br_token)
+
+    body = soup.body or soup
+    block_tags = {"p", "li", "pre", "h1", "h2", "h3", "h4", "h5", "h6"}
+
+    def _norm_newlines(s: str) -> str:
+        return s.replace("\r\n", "\n").replace("\r", "\n")
+
+    def _indent_level(tag: Tag) -> int:
+        cur: Tag | None = tag
+        while isinstance(cur, Tag):
+            classes = cur.get("class") or []
+            for c in classes:
+                m = re.match(r"ql-indent-(\d+)", str(c))
+                if m:
+                    return int(m.group(1))
+            if cur is body:
+                break
+            cur = cur.parent if isinstance(cur.parent, Tag) else None
+        return 0
+
+    def _has_desc_block(t: Tag) -> bool:
+        for child in t.find_all(list(block_tags), recursive=True):
+            if child is not t:
+                return True
+        return False
+
+    def _text_of(tag: Tag) -> str:
+        if tag.name and tag.name.lower() == "pre":
+            raw = tag.get_text()
+            raw = raw.replace(br_token, "\n").replace("\xa0", " ")
+            raw = _norm_newlines(raw)
+            return "\n".join(line.rstrip() for line in raw.split("\n")).rstrip()
+
+        raw = tag.get_text(separator=" ", strip=False)
+        raw = raw.replace(br_token, "\n").replace("\xa0", " ")
+        raw = _norm_newlines(raw)
+
+        # Любые переносы строк/табуляции из исходного HTML считаем пробелами
+        # (реальные переводы строк должны приходить только из <br> или <pre>).
+        raw = raw.replace("\n", " ")
+        raw = re.sub(r"[ \t\f\v]+", " ", raw).strip()
+        raw = re.sub(r" *\n *", "\n", raw)
+        return raw
+
+    blocks_all = body.find_all(list(block_tags))
+    blocks = [t for t in blocks_all if not _has_desc_block(t)]
+
+    out_lines: list[str] = []
+    for el in blocks:
+        txt = _text_of(el)
+        if not txt:
+            continue
+
+        lvl = _indent_level(el)
+        prefix = (" " * (lvl * indent_spaces)) if lvl > 0 else ""
+
+        if el.name and el.name.lower() == "li":
+            for line in txt.split("\n"):
+                line = line.strip()
+                if not line:
+                    continue
+                out_lines.append(prefix + "- " + line)
+            continue
+
+        for line in txt.split("\n"):
+            if line.strip() == "":
+                out_lines.append("")
+            else:
+                out_lines.append(prefix + line.rstrip())
 
     result = "\n".join(out_lines)
     result = _norm_newlines(result)
@@ -1241,6 +2029,94 @@ def _close_edit_dialog_state():
     st.session_state.pop("force_edit_page_id_once", None)
 
 
+# =========================
+# ✅ STATUS column: renderer + dblclick cycle
+# =========================
+STATUS_VALUE_FORMATTER = JsCode(
+    """
+function(params) {
+  return "●"; // рисуем кружок символом, без HTML/DOM
+}
+"""
+)
+
+STATUS_CELL_STYLE = JsCode(
+    """
+function(params) {
+  const c = (params.value || "#FFFFFF").toString().trim();
+  return {
+    display: "flex",
+    justifyContent: "center",
+    alignItems: "center",
+    // размер кружка = размер шрифта символа "●"
+    fontSize: "27px",
+    lineHeight: "27px",
+    padding: "0",
+    color: c,
+    // лёгкая обводка/контраст на белом можно имитировать тенью:
+    textShadow: "0 0 1px rgba(0,0,0,1)"
+  };
+}
+"""
+)
+
+
+
+STATUS_DBLCLICK_HANDLER = JsCode(
+    """
+function(e) {
+  if (!e || !e.colDef || e.colDef.field !== 'status') return;
+
+const colors = ['#FFFFFF', '#FFF59D', '#90CAF9', '#A5D6A7', '#EF9A9A', '#CE93D8']; // белый, желтый, зеленый, красный, синий
+  let cur = (e.data.status || '#FFFFFF').toString().trim().toUpperCase();
+
+  const idx = colors.indexOf(cur);
+  const next = colors[(idx >= 0 ? idx + 1 : 0) % colors.length];
+
+  e.node.setDataValue('status', next);
+  e.api.refreshCells({ rowNodes: [e.node], columns: ['status'], force: true });
+}
+"""
+)
+
+
+
+HELP_SEARCH_MD = r"""
+## 🔎 Расширенный поиск
+
+Поиск работает по **названию** и **содержимому** страницы, а если начать запрос с `#` то поиск работает по **тегам**.
+
+### Основные правила
+- **Пробел = AND** (пробел между словами в поиске - оба слова должны присутствовать в тексте/заголовке/теге)
+- **`|` = OR** (символ | между словами в поиске - одно из слов должно присутствовать)
+- **Скобки** `(...)` группируют выражения, т.е. можно сочитать условия AND, OR, NOT ...
+- **`+`** — обязательное слово (аналогично просто слову, но явнее)
+- **`-`** — исключить слово/фразу (NOT)
+- **Кавычки** `"..."` — точная фраза
+- **`*`** — любой набор символов (wildcard)
+
+### Приоритеты (важно!)
+`AND` сильнее чем `OR`, как в Google.
+
+Пример:
+`a | b c`  трактуется как `a OR (b AND c)`
+
+### Примеры
+- `(ноутбук | компьютер) + dell - asus`  
+  → (ноутбук ИЛИ компьютер) И обязательно dell И НЕТ asus
+
+- `"искусственный интеллект" | "машинное обучение"`  
+  → одна из точных фраз
+
+- `лучший*в*мире + ресторан - дорогой`  
+  → wildcard + AND + NOT
+
+### Поиск по тегам
+- Чтобы искать **только по тегам**, начни запрос с `#`  
+  Пример: `#1969 | 258`
+"""
+
+
 
 def main():
     st.set_page_config(
@@ -1248,6 +2124,8 @@ def main():
         page_title="ДФИП_Notes",
         initial_sidebar_state="expanded",
     )
+
+    cleanup_docs_dir()
 
     st.markdown(
         """
@@ -1267,9 +2145,6 @@ def main():
         """,
         unsafe_allow_html=True,
     )
-
-
-
 
     ensure_db_credentials()
     owned_notebooks_df = pd.DataFrame()
@@ -1320,7 +2195,7 @@ def main():
             st.session_state["department_selector"] = default_row
 
         selected_department = st.sidebar.selectbox(
-            "Подразделение",
+            "Поиск по подразделению",
             dept_records,
             format_func=lambda row: row.name_department,
             key="department_selector",
@@ -1337,7 +2212,20 @@ def main():
     def _clear_page_search():
         st.session_state["page_search"] = ""
 
-    search_col, clear_col = st.sidebar.columns([12, 2])
+
+
+    @st.dialog("Справка", width="large")
+    def search_help_dialog():
+        st.markdown(HELP_SEARCH_MD)
+
+    def _clear_page_search():
+        st.session_state["page_search"] = ""
+
+    # уникальный префикс (можно оставить константой)
+    SEARCH_UI_PREFIX = "pages_search_ui"
+
+    search_col, clear_col, help_col = st.sidebar.columns([12, 2, 2])
+
     with search_col:
         search_raw = st.text_input(
             label="",
@@ -1345,8 +2233,28 @@ def main():
             placeholder="Поиск страниц по #tag или тексту",
             label_visibility="collapsed",
         )
+
     with clear_col:
-        st.button("✕", key="clear_page_search", help="Очистить поиск", on_click=_clear_page_search)
+        st.button(
+            "✕",
+            key=f"{SEARCH_UI_PREFIX}_clear_btn",
+            help="Очистить поиск",
+            on_click=_clear_page_search,
+            use_container_width=True,
+        )
+
+    with help_col:
+        if st.button(
+            "❓",
+            key=f"{SEARCH_UI_PREFIX}_help_btn",
+            help="Справка по расширенному поиску",
+            use_container_width=True,
+        ):
+            search_help_dialog()
+
+
+
+
 
     search_raw = (search_raw or "").strip()
     search_tags_only = search_raw.startswith("#")
@@ -1357,7 +2265,12 @@ def main():
     # --- список книг ---
     notebooks_df = get_notebooks(selected_login, user_dep_id)
     filtered_notebooks_df = notebooks_df.copy()
+    # ✅ Все книги, доступные пользователю по правилам get_notebooks (owners/00/99/подразделения)
+    visible_notebook_ids = notebooks_df["id"].astype(int).tolist() if not notebooks_df.empty else []
+   
     current_department_id: str = st.session_state.get("current_department_id", "00")
+
+
 
     if current_department_id != "00" and not filtered_notebooks_df.empty:
         dep_col = filtered_notebooks_df["department_id"].fillna("00").astype(str)
@@ -1605,10 +2518,12 @@ def main():
     dept_notebook_ids = filtered_notebooks_df["id"].astype(int).tolist() if not filtered_notebooks_df.empty else []
 
     if search_text:
+        # ✅ при поиске ищем по ВСЕМ доступным книгам пользователя
         search_notebook_id = None
         search_section_id = None
-        search_allowed_ids = dept_notebook_ids
+        search_allowed_ids = visible_notebook_ids
     else:
+        # ✅ без поиска показываем страницы выбранного раздела выбранной книги
         search_notebook_id = selected_notebook_id
         search_section_id = selected_section_id
         search_allowed_ids = dept_notebook_ids
@@ -1621,11 +2536,18 @@ def main():
         search_tags_only,
     )
 
+
+    # ✅ защита: load_pages_df / run_fetch_df должны возвращать DataFrame
+    if pages_df is None:
+        pages_df = pd.DataFrame()
+
+
     if pages_df.empty:
         pages_df = pd.DataFrame(
             columns=[
                 "id",
                 "title",
+                "status",
                 "tag",
                 "body_html",
                 "created_at",
@@ -1695,13 +2617,17 @@ def main():
             st.session_state["open_editor_once_for_page"] = new_page_id
             st.rerun()
 
-
-
-
-
-
     # ---------- Список страниц ----------
-    df_display = pages_df[["id", "title"]].copy().reset_index(drop=True)
+    # ✅ добавили статус в отображаемый df
+    df_display = pages_df[["id", "title", "status"]].copy().reset_index(drop=True)
+
+    # нормализация на всякий случай (если NULL)
+    if "status" in df_display.columns:
+        df_display["status"] = df_display["status"].fillna("#FFFFFF").astype(str)
+
+    # снимок для сравнения изменений (чтобы поймать, какие status реально поменялись)
+    if "pages_grid_prev_df" not in st.session_state:
+        st.session_state["pages_grid_prev_df"] = df_display.copy()
 
     gb = GridOptionsBuilder.from_dataframe(df_display)
 
@@ -1711,13 +2637,27 @@ def main():
     # ВАЖНО: id скрыт и не участвует в подгонке ширины
     gb.configure_column("id", header_name="ID", hide=True, suppressSizeToFit=True)
 
-    # Единственная видимая колонка — растягиваем на всю ширину
+    # ✅ колонка кружка status (СПРАВА от "Страница")
     gb.configure_column(
         "title",
         header_name="Страница",
-        flex=1,          # заполняет всё доступное
+        flex=1,
         minWidth=160,
         resizable=True,
+    )
+    gb.configure_column(
+        "status",
+        header_name="",
+        width=44,
+        minWidth=44,
+        maxWidth=44,
+        sortable=False,
+        filter=False,
+        editable=False,
+        resizable=False,
+        valueFormatter=STATUS_VALUE_FORMATTER,
+        cellStyle=STATUS_CELL_STYLE,
+        suppressSizeToFit=True,
     )
 
     # (опционально) defaultColDef — на всякий случай
@@ -1737,11 +2677,9 @@ def main():
         function(params) {
             try { params.api.sizeColumnsToFit(); } catch(e) {}
 
-            // на всякий случай после отрисовки (иногда Streamlit/Sidebar меняют размеры позже)
             setTimeout(function(){ try { params.api.sizeColumnsToFit(); } catch(e) {} }, 50);
             setTimeout(function(){ try { params.api.sizeColumnsToFit(); } catch(e) {} }, 200);
 
-            // при ресайзе окна
             if (!window.__notes_pages_resize_bound) {
                 window.__notes_pages_resize_bound = true;
                 window.addEventListener('resize', function() {
@@ -1763,6 +2701,8 @@ def main():
     gb.configure_grid_options(
         onGridReady=on_grid_ready,
         onFirstDataRendered=on_first_data_rendered,
+        # ✅ dblclick по кружку только владельцам
+        onCellDoubleClicked=(STATUS_DBLCLICK_HANDLER if can_edit_notebook else None),
     )
 
     list_container = st.sidebar.container()
@@ -1771,11 +2711,76 @@ def main():
             df_display,
             gridOptions=gb.build(),
             enable_enterprise_modules=False,
-            update_on=["selectionChanged"],
+            # ✅ важно: чтобы изменения из JS (setDataValue) возвращались в python
+            update_mode=GridUpdateMode.MODEL_CHANGED,
+            data_return_mode=DataReturnMode.AS_INPUT,
             height=750,
-            fit_columns_on_grid_load=True,   # ✅ ключевой фикс: колонка "Страница" = вся ширина грида
+            fit_columns_on_grid_load=True,
             allow_unsafe_jscode=True,
         )
+
+
+    # --- безопасно достаём data из grid_response (может быть list или DataFrame) ---
+    raw_data = grid_response.get("data", [])
+    if isinstance(raw_data, pd.DataFrame):
+        df_after = raw_data.copy()
+    elif isinstance(raw_data, list):
+        df_after = pd.DataFrame(raw_data)
+    else:
+        df_after = pd.DataFrame()
+
+    df_before = st.session_state.get("pages_grid_prev_df", df_display.copy())
+
+
+    if not df_after.empty and "id" in df_after.columns and "status" in df_after.columns:
+        df_after["status"] = df_after["status"].fillna("#FFFFFF").astype(str)
+        df_before_local = df_before.copy()
+
+        if not isinstance(df_before, pd.DataFrame):
+            df_before = df_display.copy()
+
+
+        merged = df_after[["id", "status"]].merge(
+            df_before_local[["id", "status"]],
+            on="id",
+            how="left",
+            suffixes=("_new", "_old"),
+        )
+
+        changed = merged[merged["status_new"] != merged["status_old"]]
+        if not changed.empty:
+            if can_edit_notebook:
+                for row in changed.itertuples(index=False):
+                    page_id_upd = int(row.id)
+                    new_status = str(row.status_new or "#FFFFFF").strip()
+
+                    # защита: разрешаем только заданные цвета, иначе ставим белый
+                    new_status = new_status.upper()
+                    allowed = {"#FFFFFF", "#FFF59D", "#90CAF9", "#A5D6A7", "#EF9A9A", "#CE93D8"}
+                    if new_status not in allowed:
+                        new_status = "#FFFFFF"
+
+
+                    run_execute(
+                        f"""
+                        UPDATE {PAGES_TABLE}
+                        SET status = '{_escape(new_status)}'
+                        WHERE id = {int(page_id_upd)}
+                        """
+                    )
+
+                # обновляем "предыдущее" состояние, чтобы не обновлять повторно
+                st.session_state["pages_grid_prev_df"] = df_after.copy()
+
+                # перечитать/перерисовать, чтобы pages_df внизу был синхронен
+                st.rerun()
+            else:
+                # не владелец — откатываем снимок и предупреждаем
+                st.session_state["pages_grid_prev_df"] = df_display.copy()
+                st.warning("Менять статус страниц может только владелец книги.")
+                st.rerun()
+    else:
+        st.session_state["pages_grid_prev_df"] = df_after.copy() if not df_after.empty else df_display.copy()
 
     # --- выбор страницы из грида (ОБЯЗАТЕЛЬНО объявляем page_id заранее) ---
     page_id: int | None = None
@@ -1797,13 +2802,6 @@ def main():
             if (pages_df["id"].astype(int) == int(stored_page_id)).any():
                 page_id = int(stored_page_id)
 
-
-
-
-
-
-
-
     # ---------- Просмотр / редактирование выбранной страницы ----------
     if page_id is not None:
         current_page = pages_df[pages_df["id"] == page_id].iloc[0]
@@ -1816,11 +2814,12 @@ def main():
         dept_prefix = f"[{dept_name_for_page}] " if dept_name_for_page else ""
 
         safe_title = current_title or f"Страница_{page_id}"
+        page_path = f"{current_page['notebook_name']} > {current_page['section_name']} > {current_page['title']}"
         info_left, info_right = st.columns([12, 3])
         with info_left:
             st.caption(
-                f"{dept_prefix}  {current_page['notebook_name']}  =>  "
-                f"{current_page['section_name']}  =>  {current_page['title']}"
+                f"{dept_prefix}  {current_page['notebook_name']}  >  "
+                f"{current_page['section_name']}  >  {current_page['title']}"
             )
             if current_tag:
                 st.caption(f"Tag: {current_tag}")
@@ -1838,7 +2837,7 @@ def main():
             padding: 16px 18px;
             background-color: #ffffff;
             box-shadow: 0 1px 2px rgba(0,0,0,0.04);
-            min-height: 580px;
+            min-height: 560px;
             box-sizing: border-box;
         }}
         .preview-body *,
@@ -1857,7 +2856,7 @@ def main():
             </div>
         </div>
         """
-        components.html(preview_html, height=600, scrolling=True)
+        components.html(preview_html, height=580, scrolling=True)
 
         # ---------------- Диалог редактирования (вызываем ТОЛЬКО по явному действию) ----------------
         @st.dialog("Редактирование страницы", width="large")
@@ -1889,16 +2888,62 @@ def main():
                 unsafe_allow_html=True,
             )
 
+
             col_l, col_r = st.columns([2, 2])
             with col_l:
                 new_title = st.text_input("Название страницы", value=title, key=f"dlg_title_{page_id_local}")
+
             with col_r:
-                new_tag = st.text_input(
-                    "Теги",
-                    value=tag or "",
-                    key=f"dlg_tag_{page_id_local}",
-                    placeholder="Введите тег(и) через запятую без символа #",
-                )
+                tag_col, help_col = st.columns([13,1.5])
+
+                with tag_col:
+                    new_tag = st.text_input(
+                        "Теги",
+                        value=tag or "",
+                        key=f"dlg_tag_{page_id_local}",
+                        placeholder="Введите тег(и) через запятую без символа #",
+                    )
+
+                with help_col:
+                    st.markdown("###")  # выравнивание кнопки по высоте
+                    with st.popover("❓", use_container_width=True):
+                        st.markdown(
+                            """
+            ### 📝 Справка по редактору (Quill)
+
+            **Форматирование**
+            - **B** — жирный, *I* — курсив, <u>U</u> — подчёркивание, ~~S~~ — зачёркивание  
+            - x₂ — нижний индекс, x² — верхний индекс  
+
+            **Цвет**
+            - A — цвет текста  
+            - A (с фоном) — цвет подсветки (фон)
+
+            **Списки и выравнивание**
+            - Маркированный / нумерованный список  
+            - Выравнивание: слева / центр / справа / по ширине
+
+            **Заголовки**
+            - H1 / H2 — заголовки  
+            - Normal — обычный текст
+
+            **Дополнительно**
+            - fx — формулы  
+            - “ ” — цитата  
+            - </> — код / блок кода  
+            - Tx — очистить форматирование
+
+            **Вставка**
+            - 🔗 — ссылка  
+            - 🖼 — изображение  
+
+            ℹ️ Вставка из Word/Excel может приносить таблицы. HTML дополнительно очищается от опасных тегов.
+            """
+                        )
+
+
+
+
 
             editable_html = html_body or ""
 
@@ -1936,13 +2981,12 @@ def main():
             edit_page_dialog(page_id, current_title, current_html, current_tag)
 
         # --- кнопка редактирования + экспорт + вложения + перемещение ---
-        col1, col2, col3, col4 = st.columns([1.5, 1.5, 3, 3])
+        col1, col2, col3, col4 = st.columns([1.8, 1.2, 3, 3])
 
         # ---------------- Редактировать ----------------
         with col1:
             if can_edit_notebook:
                 if st.button("Редактировать страницу", key=f"open_edit_dialog_{page_id}", use_container_width=True):
-                    # ✅ открываем диалог напрямую (без session_state-сторожа)
                     edit_page_dialog(page_id, current_title, current_html, current_tag)
             else:
                 st.caption("Просмотр (редактирование недоступно)")
@@ -1985,6 +3029,13 @@ def main():
                     on_click=_collapse_export,
                 )
 
+                if st.button("eMail", key=f"open_email_dialog_{page_id}", use_container_width=True):
+                    st.session_state["email_dialog_page_id"] = page_id
+
+                if st.session_state.get("email_dialog_page_id") == page_id:
+                    email_message_dialog(page_id, safe_title2, current_html or "", selected_login, page_path)
+                    _collapse_export()
+
         # ---------------- Вложения ----------------
         with col3:
             exp_nonce_key = f"exp_files_nonce_{page_id}"
@@ -2019,9 +3070,7 @@ def main():
 
                                 st.success(f"Сохранено файлов: {len(uploaded_files)}")
 
-                                # ✅ очистить file_uploader
                                 st.session_state[up_nonce_files_key] += 1
-                                # ✅ гарантированно свернуть expander (пересоздать label)
                                 st.session_state[exp_nonce_key] += 1
 
                                 st.rerun()
@@ -2040,8 +3089,7 @@ def main():
                         try:
                             save_link_attachment(page_id, link_url, link_title, selected_login)
                             st.success("Ссылка сохранена")
-                            # ✅ гарантированно свернуть expander (пересоздать label)
-                            st.session_state[exp_nonce_key] += 1                            
+                            st.session_state[exp_nonce_key] += 1
                             st.rerun()
                         except ValueError as exc:
                             st.warning(str(exc))
@@ -2153,10 +3201,7 @@ def main():
                                 st.success("Страница скопирована.")
                                 st.session_state["current_page_id"] = new_page_id
                                 st.session_state["force_page_id"] = new_page_id
-
-                                # ✅ если нужно открыть редактор после копирования — one-shot
                                 st.session_state["open_editor_once_for_page"] = new_page_id
-
                                 _collapse_move()
                                 st.rerun()
 
@@ -2165,9 +3210,6 @@ def main():
                             st.rerun()
 
         # --- дальше у тебя идёт таблица вложений, удаление страницы и т.д. ---
-
-
-
 
         # --- таблица вложений ---
         attachments_df = get_page_attachments(page_id)
@@ -2181,7 +3223,6 @@ def main():
             att_display["URL"] = att_display["url"].fillna("")
             grid_df = att_display[["id", "Тип", "Название", "Размер", "Создано", "Автор", "URL"]]
 
-            # скрытые ссылки для dblclick по файлу
             links_data = []
             for row in attachments_df.itertuples(index=False):
                 if row.attachment_type == "file":
@@ -2284,21 +3325,9 @@ def main():
                 att_type = selected_att.get("Тип")
                 url_val = selected_att.get("URL") or ""
 
-                # --- Файл ---
                 if att_type == "Файл":
-                    row_meta = attachments_df[attachments_df["id"].astype(int) == int(att_id)]
-                    file_name_meta = ""
-                    mime_meta = "application/octet-stream"
-                    file_size_meta = None
-
-                    if not row_meta.empty:
-                        file_name_meta = str(row_meta.iloc[0].get("file_name") or "")
-                        mime_meta = str(row_meta.iloc[0].get("mime_type") or "application/octet-stream")
-                        file_size_meta = row_meta.iloc[0].get("file_size")
-
-                    del_col, _ = st.columns([1,  4])
-
                     if can_edit_notebook:
+                        del_col, _ = st.columns([1,  4])
                         with del_col:
                             if st.button("Удалить вложение", key=f"delete_attachment_{att_id}", use_container_width=True):
                                 delete_attachment(att_id)
@@ -2309,7 +3338,6 @@ def main():
                                 st.success("Вложение удалено")
                                 st.rerun()
 
-                # --- Ссылка ---
                 elif att_type == "Ссылка":
                     if not url_val:
                         st.warning("Ссылка не указана.")
@@ -2330,7 +3358,7 @@ def main():
             if has_attachments:
                 st.warning("Удаление страницы запрещено: сначала удалите все прикреплённые файлы и ссылки.")
 
-            col_a, col_b, col_c, col_d = st.columns([1.5, 1.5, 3, 3])
+            col_a, col_b, col_c, col_d = st.columns([1.8, 1.2, 3, 3])
 
             with col_a:
                 confirm_delete = st.checkbox(
@@ -2366,10 +3394,8 @@ def main():
         else:
             st.info("У вас права только на просмотр этой записной книжки.")
 
-    st.logo("assets/logo.png",size="medium")
+    st.logo("assets/logo.png", size="medium")
 
 
 if __name__ == "__main__":
     main()
-
-
