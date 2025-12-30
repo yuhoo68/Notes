@@ -2117,6 +2117,10 @@ HELP_SEARCH_MD = r"""
 """
 
 
+@st.dialog("Справка: Расширенный поиск", width="large")
+def help_search_dialog() -> None:
+    st.markdown(HELP_SEARCH_MD)
+
 
 def main():
     st.set_page_config(
@@ -2214,17 +2218,10 @@ def main():
 
 
 
-    @st.dialog("Справка", width="large")
-    def search_help_dialog():
-        st.markdown(HELP_SEARCH_MD)
-
-    def _clear_page_search():
-        st.session_state["page_search"] = ""
-
     # уникальный префикс (можно оставить константой)
     SEARCH_UI_PREFIX = "pages_search_ui"
 
-    search_col, clear_col, help_col = st.sidebar.columns([12, 2, 2])
+    search_col, clear_col = st.sidebar.columns([14, 2])
 
     with search_col:
         search_raw = st.text_input(
@@ -2236,21 +2233,12 @@ def main():
 
     with clear_col:
         st.button(
-            "✕",
+            "×",
             key=f"{SEARCH_UI_PREFIX}_clear_btn",
             help="Очистить поиск",
             on_click=_clear_page_search,
             use_container_width=True,
         )
-
-    with help_col:
-        if st.button(
-            "❓",
-            key=f"{SEARCH_UI_PREFIX}_help_btn",
-            help="Справка по расширенному поиску",
-            use_container_width=True,
-        ):
-            search_help_dialog()
 
 
 
@@ -3350,15 +3338,39 @@ def main():
                                     st.success("Ссылка удалена")
                                     st.rerun()
 
-        # --- Удаление страницы (с проверкой вложений) ---
+        # --- Удаление страницы (с проверкой вложений) + справка (в одну строку) ---
+        col_a, col_b, col_c, col_d = st.columns([1.8, 1.2, 3, 3])
+
+        with col_d:
+            exp_help_nonce_key = f"exp_help_nonce_{page_id}"
+            st.session_state.setdefault(exp_help_nonce_key, 0)
+
+            def _open_help(topic: str) -> None:
+                st.session_state[f"help_topic_{page_id}"] = topic
+                st.session_state[exp_help_nonce_key] += 1
+
+            exp_help_label = "Справка ?" + ("\u200b" * int(st.session_state[exp_help_nonce_key]))
+
+            with st.expander(exp_help_label, expanded=False):
+                st.button(
+                    "🔎 Расширенный поиск",
+                    key=f"help_search_open_{page_id}",
+                    help="Правила AND/OR/NOT, теги, wildcard и приоритеты",
+                    on_click=_open_help,
+                    args=("search",),
+                    use_container_width=True,
+                )
+
+            help_topic = st.session_state.pop(f"help_topic_{page_id}", None)
+            if help_topic == "search":
+                help_search_dialog()
+
         if can_edit_notebook:
             attachments_df_for_delete = get_page_attachments(page_id)
             has_attachments = not attachments_df_for_delete.empty
 
             if has_attachments:
                 st.warning("Удаление страницы запрещено: сначала удалите все прикреплённые файлы и ссылки.")
-
-            col_a, col_b, col_c, col_d = st.columns([1.8, 1.2, 3, 3])
 
             with col_a:
                 confirm_delete = st.checkbox(
