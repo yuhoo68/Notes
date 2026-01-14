@@ -17,3 +17,7 @@ pg_table_prefix = "notes_"
 
 # Relative path (from project root / app.py location) for temporary email attachments
 temp_attachments_dir = "docs"
+
+# Public base URL of the Streamlit app (used to build deep-links to pages).
+# Example: "https://notes.company.ru" or "https://notes.company.ru/Notes"
+app_base_url = "http://localhost:8501"

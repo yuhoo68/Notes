@@ -5,8 +5,10 @@ import jaydebeapi
 import config
 import pandas as pd
 from typing import Any
+from datetime import datetime
+import time
 
-def _shorten_for_log(query: str, limit: int = 150) -> str:
+def _shorten_for_log(query: str, limit: int = 2050) -> str:
     """Return a truncated version of the query for logging."""
     if len(query) <= limit:
         return query
@@ -58,13 +60,17 @@ def get_fetch(
     try:
         with conn:
             with conn.cursor() as cursor:
+                start = time.perf_counter()
                 cursor.execute(query)
+
                 rows = cursor.fetchall()
                 columns = [col[0] for col in (cursor.description or [])]
 
                 df = pd.DataFrame(rows, columns=columns)
-
-                print("Успешно выполнено:", _shorten_for_log(query))
+                end = time.perf_counter()
+                now = datetime.now()
+                # print(now.strftime("%d.%m.%Y %H:%M:%S"))
+                print(now.strftime("%d.%m.%Y %H:%M:%S") + f"  Успешно выполнено: {end - start:.6f} секунд", _shorten_for_log(query))
                 return df
 
     except Exception as exc:
