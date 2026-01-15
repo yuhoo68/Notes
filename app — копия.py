@@ -3943,7 +3943,6 @@ def main():
     st.set_page_config(
         layout="wide",
         page_title="ДФИП_Notes",
-        page_icon="assets/favicon-stack-128.png",
         initial_sidebar_state="expanded",
     )
 
@@ -4074,7 +4073,7 @@ def main():
     # уникальный префикс (можно оставить константой)
     SEARCH_UI_PREFIX = "pages_search_ui"
 
-    search_col, clear_col = st.sidebar.columns([13, 3])
+    search_col, clear_col = st.sidebar.columns([14, 2])
 
     with search_col:
         search_raw = st.text_input(
@@ -4086,9 +4085,9 @@ def main():
 
     with clear_col:
         st.button(
-            "🔄",
+            "×",
             key=f"{SEARCH_UI_PREFIX}_clear_btn",
-            help="Очистить фильтр",
+            help="Очистить поиск",
             on_click=_clear_page_search,
             use_container_width=True,
         )
@@ -4858,81 +4857,6 @@ def main():
                     st.caption("Заполните `config.app_base_url`.")
 
         safe_preview_html = sanitize_html_safe(current_html or "")
-        highlight_query = (search_text or "").strip()
-        highlight_block = ""
-        if highlight_query and not pages_df.empty:
-            highlight_block = f"""
-            <style>
-            mark.search-hit {{
-                background-color: #fff59d;
-                padding: 0 2px;
-            }}
-            </style>
-            <script>
-            (() => {{
-                const rawQuery = {json.dumps(highlight_query)};
-                const query = (rawQuery || "").trim();
-                if (!query) return;
-
-                const root = document.querySelector(".preview-body");
-                if (!root) return;
-
-                // Убираем предыдущие подсветки перед новым поиском
-                root.querySelectorAll("mark.search-hit").forEach((el) => {{
-                    const textNode = document.createTextNode(el.textContent);
-                    el.replaceWith(textNode);
-                }});
-
-                const queryLower = query.toLowerCase();
-                const queryLength = query.length;
-                const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {{
-                    acceptNode: (node) => {{
-                        const parent = node?.parentNode;
-                        if (!parent) return NodeFilter.FILTER_REJECT;
-                        const tag = parent.nodeName;
-                        if (tag === "SCRIPT" || tag === "STYLE") return NodeFilter.FILTER_REJECT;
-                        if (!node.textContent || !node.textContent.trim()) return NodeFilter.FILTER_SKIP;
-                        return NodeFilter.FILTER_ACCEPT;
-                    }},
-                }});
-
-                let firstMark = null;
-                while (true) {{
-                    const textNode = walker.nextNode();
-                    if (!textNode) break;
-
-                    const original = textNode.textContent || "";
-                    const lower = original.toLowerCase();
-                    let idx = lower.indexOf(queryLower);
-                    if (idx === -1) continue;
-
-                    let lastIndex = 0;
-                    const frag = document.createDocumentFragment();
-                    while (idx !== -1) {{
-                        if (idx > lastIndex) {{
-                            frag.appendChild(document.createTextNode(original.slice(lastIndex, idx)));
-                        }}
-                        const mark = document.createElement("mark");
-                        mark.className = "search-hit";
-                        mark.textContent = original.slice(idx, idx + queryLength);
-                        frag.appendChild(mark);
-                        if (!firstMark) firstMark = mark;
-                        lastIndex = idx + queryLength;
-                        idx = lower.indexOf(queryLower, lastIndex);
-                    }}
-                    if (lastIndex < original.length) {{
-                        frag.appendChild(document.createTextNode(original.slice(lastIndex)));
-                    }}
-                    textNode.replaceWith(frag);
-                }}
-
-                if (firstMark && typeof firstMark.scrollIntoView === "function") {{
-                    firstMark.scrollIntoView({{ behavior: "smooth", block: "center" }});
-                }}
-            }})();
-            </script>
-            """
-
         preview_html = f"""
         <style>
         .page-preview-wrapper {{
@@ -4959,7 +4883,6 @@ def main():
                 {safe_preview_html or "<p><em>Нет содержимого</em></p>"}
             </div>
         </div>
-        {highlight_block}
         """
         components.html(preview_html, height=580, scrolling=True)
 
