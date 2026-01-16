@@ -180,7 +180,8 @@ def _fields_like_expr_text(like_pattern_sql: str) -> str:
     esc = " ESCAPE E'\\\\' "
     return (
         f"(COALESCE(p.title, '') ILIKE {like_pattern_sql}{esc}"
-        f"OR COALESCE(p.body_html, '') ILIKE {like_pattern_sql}{esc})"
+        f" OR COALESCE(p.body_html, '') ILIKE {like_pattern_sql}{esc}"
+        f" OR COALESCE(p.tag, '') ILIKE {like_pattern_sql}{esc})"
     )
 
 
@@ -4675,7 +4676,7 @@ def main():
             # update_mode=GridUpdateMode.MODEL_CHANGED | GridUpdateMode.SELECTION_CHANGED,
             update_mode=GridUpdateMode.MODEL_CHANGED,
             data_return_mode=DataReturnMode.AS_INPUT,
-            height=750,
+            height=650,
             fit_columns_on_grid_load=True,
             allow_unsafe_jscode=True,
         )
