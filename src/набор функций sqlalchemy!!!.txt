@@ -1,0 +1,138 @@
+from __future__ import annotations
+
+from typing import Any, Mapping, Optional
+import time
+import sqlalchemy as sa
+from sqlalchemy import text
+from sqlalchemy.engine import Engine
+
+Params = Optional[Mapping[str, Any]]
+
+# logger должен быть определён у тебя в проекте, как и раньше:
+# import logging
+# logger = logging.getLogger(__name__)
+
+
+def make_engine(user_name: str, user_passw: str, host: str = "0.0.0.0", database: str = "drp") -> Engine:
+    url = sa.URL.create(
+        "postgresql",
+        username=user_name,
+        password=user_passw,
+        host=host,
+        database=database,
+    )
+    return sa.create_engine(url, future=True)
+
+
+def _shorten_query(query: str, limit: int = 1050) -> str:
+    q = (query or "").strip()
+    if len(q) <= limit:
+        return q
+    return q[:limit] + "... (обрезано)"
+
+
+def _log_ok(fn_name: str, query: str, elapsed_s: float) -> None:
+    logger.info("%s took %.3f s", fn_name, elapsed_s)
+    print("+++++++++++++++++++++++ Запрос выполнен:", _shorten_query(query))
+
+
+def _log_err(fn_name: str, query: str, elapsed_s: float, e: Exception) -> None:
+    logger.info("%s failed after %.3f s", fn_name, elapsed_s)
+    print("Ошибка при выполнении запроса:", e)
+    print("+++++++++++++++++++++++ Запрос (ошибка):", _shorten_query(query))
+
+
+def execute_scalar(engine: Engine, query: str, params: Params = None) -> Any | None:
+    """
+    Возвращает первый столбец первой строки, либо None.
+    SELECT count(*), INSERT/UPDATE/DELETE ... RETURNING id, и т.п.
+    """
+    t0 = time.perf_counter()
+    try:
+        stmt = text(query)
+        with engine.begin() as conn:
+            result = conn.execute(stmt, params or {})
+            value = result.scalar_one_or_none() if result.returns_rows else None
+
+        _log_ok("execute_scalar", query, time.perf_counter() - t0)
+        return value
+
+    except Exception as e:
+        _log_err("execute_scalar", query, time.perf_counter() - t0, e)
+        return None
+
+
+def execute_fetchone(engine: Engine, query: str, params: Params = None, *, as_dict: bool = False) -> Any | None:
+    """
+    Возвращает одну строку, либо None.
+    - as_dict=False -> Row (можно обращаться как row[0], row["col"] через row._mapping)
+    - as_dict=True  -> dict
+    """
+    t0 = time.perf_counter()
+    try:
+        stmt = text(query)
+        with engine.begin() as conn:
+            result = conn.execute(stmt, params or {})
+            if not result.returns_rows:
+                row = None
+            else:
+                row = result.fetchone()
+
+        _log_ok("execute_fetchone", query, time.perf_counter() - t0)
+
+        if row is None:
+            return None
+        return dict(row._mapping) if as_dict else row
+
+    except Exception as e:
+        _log_err("execute_fetchone", query, time.perf_counter() - t0, e)
+        return None
+
+
+def execute_fetchall(engine: Engine, query: str, params: Params = None, *, as_dict: bool = False) -> list[Any]:
+    """
+    Возвращает список строк.
+    - as_dict=False -> list[Row]
+    - as_dict=True  -> list[dict]
+    Если запрос не возвращает строки или при ошибке — вернёт [].
+    """
+    t0 = time.perf_counter()
+    try:
+        stmt = text(query)
+        with engine.begin() as conn:
+            result = conn.execute(stmt, params or {})
+            if not result.returns_rows:
+                rows = []
+            else:
+                rows = result.fetchall()
+
+        _log_ok("execute_fetchall", query, time.perf_counter() - t0)
+
+        if not rows:
+            return []
+        if not as_dict:
+            return list(rows)
+        return [dict(r._mapping) for r in rows]
+
+    except Exception as e:
+        _log_err("execute_fetchall", query, time.perf_counter() - t0, e)
+        return []
+
+
+def execute_only(engine: Engine, query: str, params: Params = None) -> None:
+    """
+    Выполняет запрос без результата (DDL, UPDATE/INSERT без RETURNING и т.п.).
+    Ничего не возвращает.
+    """
+    t0 = time.perf_counter()
+    try:
+        stmt = text(query)
+        with engine.begin() as conn:
+            conn.execute(stmt, params or {})
+
+        _log_ok("execute_only", query, time.perf_counter() - t0)
+        return None
+
+    except Exception as e:
+        _log_err("execute_only", query, time.perf_counter() - t0, e)
+        return None

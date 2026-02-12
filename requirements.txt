@@ -1,10 +1,11 @@
 pandas>=2.3
 streamlit=1.48.1
 streamlit-aggrid==1.2.1
-streamlit-quill=0.0.3
+streamlit-quill==0.0.3
 beautifulsoup4==4.12.2
 jaydebeapi>=1.2
 requests>=2.31
 python-docx==1.1.2
-xhtml2pdf>=0.2
-
+#xhtml2pdf>=0.2
+SQLAlchemy==2.0.45
+psycopg2-binary==2.9.10

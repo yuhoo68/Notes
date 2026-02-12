@@ -1,141 +1,183 @@
+# vers: 1.04
 from __future__ import annotations
-import os
-from typing import Any, Iterable
-import jaydebeapi
-import config
-import pandas as pd
-from typing import Any
-from datetime import datetime
+
+from typing import Any, Mapping, Optional
+import logging
+import sys
 import time
 
-def _shorten_for_log(query: str, limit: int = 2050) -> str:
-    """Return a truncated version of the query for logging."""
-    if len(query) <= limit:
-        return query
-    return query[:limit] + "... (truncated)"
+import pandas as pd
+import sqlalchemy as sa
+from sqlalchemy import text
+from sqlalchemy.engine import Engine, URL
 
 
-def _connect_postgres(user: str, password: str) -> jaydebeapi.Connection | None:
-    """
-    Open a JDBC connection to PostgreSQL using the provided parameters.
+logger = logging.getLogger("notes_app.db")
 
-    jdbc_url and driver_jar are taken from config.py.
-    """
-    jdbc_url = getattr(config, "jdbc_url", None)
-    driver_jar = getattr(config, "driver_jar", None)
-    if not jdbc_url or not driver_jar:
-        print("Ошибка: jdbc_url или driver_jar не заданы в config.py")
-        return None
-    driver_class = "org.postgresql.Driver"
-    if not os.path.isfile(driver_jar):
-        print(f"Driver JAR not found: {driver_jar}")
-        return None
-    try:
-        return jaydebeapi.connect(
-            jclassname=driver_class,
-            url=jdbc_url,
-            driver_args={"user": user, "password": password},
-            jars=[driver_jar],
-        )
-    except Exception as exc:
-        print("Ошибка: не удалось установить соединение с базой данных.", exc)
-        return None
+Params = Optional[Mapping[str, Any]]
 
 
+def _safe_text(value: Any) -> str:
+    raw = str(value)
+    encoding = getattr(getattr(sys, "stdout", None), "encoding", None) or "utf-8"
+    return raw.encode(encoding, errors="replace").decode(encoding, errors="replace")
 
-def get_fetch(
-    query: str,
+
+def _friendly_error_text(exc: Exception) -> str:
+    # На некоторых Windows+PostgreSQL локалях psycopg2 может кидать UnicodeDecodeError
+    # вместо штатного сообщения об отказе в подключении.
+    if isinstance(exc, UnicodeDecodeError):
+        return "Не удалось декодировать ответ PostgreSQL. Проверьте логин/пароль и локаль сервера."
+    return _safe_text(exc)
+
+
+def _shorten_query(query: str, limit: int = 1050) -> str:
+    q = (query or "").strip()
+    if len(q) <= limit:
+        return q
+    return q[:limit] + "... (обрезано)"
+
+
+def _log_ok(fn_name: str, query: str, elapsed_s: float) -> None:
+    logger.info("%s took %.3f s", fn_name, elapsed_s)
+    # print(f"+++++++++++++++++++++++ Запрос выполнен: {_safe_text(_shorten_query(query))}")
+
+
+def _log_err(fn_name: str, query: str, elapsed_s: float, exc: Exception) -> None:
+    logger.info("%s failed after %.3f s", fn_name, elapsed_s)
+    print(f"Ошибка при выполнении запроса: {_friendly_error_text(exc)}")
+    # print(f"+++++++++++++++++++++++ Запрос (ошибка): {_safe_text(_shorten_query(query))}")
+
+
+def _defaults() -> tuple[str, int, str]:
+    return "localhost", 5432, "postgres"
+
+
+
+
+def make_engine(
     user_name: str,
-    user_passw: str
-) -> pd.DataFrame | None:
-    """
-    Execute a SELECT (or any read) query and return result as a pandas DataFrame.
+    user_passw: str,
+    host: str | None = None,
+    port: int | None = None,
+    database: str | None = None,
+) -> Engine:
+    default_host, default_port, default_db = _defaults()
 
-    Uses PostgreSQL JDBC connection details from config.py.
+    url = URL.create(
+        "postgresql+psycopg2",
+        username=user_name,
+        password=user_passw,
+        host=host or default_host,
+        port=port if port is not None else default_port,
+        database=database or default_db,
+    )
+
+    # Не задаем server options (например lc_messages), потому что у части ролей
+    # нет прав на изменение параметров сеанса.
+    connect_args = {"connect_timeout": 5}
+    return sa.create_engine(url, future=True, pool_pre_ping=True, connect_args=connect_args)
+
+
+def execute_scalar(engine: Engine, query: str, params: Params = None) -> Any | None:
     """
-    conn = _connect_postgres(user_name, user_passw)
-    if conn is None:
+    Возвращает первый столбец первой строки, либо None.
+    SELECT count(*), INSERT/UPDATE/DELETE ... RETURNING id, и т.п.
+    """
+    t0 = time.perf_counter()
+    try:
+        stmt = text(query)
+        with engine.begin() as conn:
+            result = conn.execute(stmt, params or {})
+            value = result.scalar_one_or_none() if result.returns_rows else None
+
+        _log_ok("execute_scalar", query, time.perf_counter() - t0)
+        return value
+    except Exception as exc:
+        _log_err("execute_scalar", query, time.perf_counter() - t0, exc)
+        logger.warning("execute_scalar SQLAlchemy failed: %s", _friendly_error_text(exc))
         return None
+
+
+def get_fetchone(engine: Engine, query: str, params: Params = None, *, as_dict: bool = False) -> Any | None:
+    """
+    Возвращает одну строку, либо None.
+    - as_dict=False -> Row
+    - as_dict=True  -> dict
+    """
+    t0 = time.perf_counter()
+    try:
+        stmt = text(query)
+        with engine.begin() as conn:
+            result = conn.execute(stmt, params or {})
+            row = result.fetchone() if result.returns_rows else None
+
+        _log_ok("get_fetchone", query, time.perf_counter() - t0)
+        if row is None:
+            return None
+        return dict(row._mapping) if as_dict else row
+    except Exception as exc:
+        _log_err("get_fetchone", query, time.perf_counter() - t0, exc)
+        logger.warning("get_fetchone SQLAlchemy failed: %s", _friendly_error_text(exc))
+        return None
+
+
+def get_fetch(engine: Engine, query: str) -> pd.DataFrame | None:
+    t0 = time.perf_counter()
 
     try:
-        with conn:
-            with conn.cursor() as cursor:
-                start = time.perf_counter()
-                cursor.execute(query)
+        stmt = text(query)
+        with engine.connect() as conn:
+            result = conn.execute(stmt)
+            rows = result.fetchall() if result.returns_rows else []
+            columns = list(result.keys()) if result.returns_rows else []
 
-                rows = cursor.fetchall()
-                columns = [col[0] for col in (cursor.description or [])]
-
-                df = pd.DataFrame(rows, columns=columns)
-                end = time.perf_counter()
-                now = datetime.now()
-                # print(now.strftime("%d.%m.%Y %H:%M:%S"))
-                print(now.strftime("%d.%m.%Y %H:%M:%S") + f"  Успешно выполнено: {end - start:.6f} секунд", _shorten_for_log(query))
-                return df
-
+        _log_ok("get_fetch", query, time.perf_counter() - t0)
+        return pd.DataFrame(rows, columns=columns)
     except Exception as exc:
-        print("Ошибка при выполнении запроса:", exc)
+        _log_err("get_fetch", query, time.perf_counter() - t0, exc)
+        logger.warning("get_fetch SQLAlchemy failed: %s", _friendly_error_text(exc))
         return None
 
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
 
-
-
-def get_execute(query: str, user_name: str, user_passw: str) -> int | None:
-    """
-    Execute a DDL/DML query (INSERT/UPDATE/DELETE/DDL).
-
-    Returns the number of affected rows when available, otherwise None.
-    """
-    conn = _connect_postgres(user_name, user_passw)
-    if conn is None:
-        return None
+def get_execute(engine: Engine, query: str) -> int | None:
+    t0 = time.perf_counter()
 
     try:
-        with conn:
-            with conn.cursor() as cursor:
-                cursor.execute(query)
-                affected = cursor.rowcount
-                print("Успешно выполнено:", _shorten_for_log(query))
-                return affected
+        stmt = text(query)
+
+        with engine.begin() as conn:
+            result = conn.execute(stmt)
+            affected = result.rowcount
+
+        _log_ok("get_execute", query, time.perf_counter() - t0)
+        if affected is None or affected < 0:
+            return None
+        return int(affected)
     except Exception as exc:
-        print("Ошибка при выполнении запроса:", exc)
+        _log_err("get_execute", query, time.perf_counter() - t0, exc)
+        logger.warning("get_execute SQLAlchemy failed: %s", _friendly_error_text(exc))
         return None
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
 
 
 def test_connection(user_name: str, user_passw: str) -> bool:
-    """
-    Проверяет успешность подключения.
-
-    Возвращает True, если удалось подключиться и выполнить простой запрос,
-    иначе False. Сообщает версию PostgreSQL при успехе.
-    """
-    conn = _connect_postgres(user_name, user_passw)
-    if conn is None:
-        return False
+    t0 = time.perf_counter()
+    query = "SELECT version()"
+    engine: Engine | None = None
 
     try:
-        with conn:
-            with conn.cursor() as cursor:
-                cursor.execute("SELECT version()")
-                row = cursor.fetchone()
-                version = row[0] if row else "unknown"
-                print("Подключение установлено. PostgreSQL version:", version)
-                return True
+        engine = make_engine(user_name, user_passw)
+        stmt = text(query)
+        with engine.connect() as conn:
+            version = conn.execute(stmt).scalar_one_or_none() or "unknown"
+
+        _log_ok("test_connection", query, time.perf_counter() - t0)
+        print(f"Подключение установлено. Версия PostgreSQL: {_safe_text(version)}")
+        return True
     except Exception as exc:
-        print("Ошибка при проверке соединения:", exc)
+        _log_err("test_connection", query, time.perf_counter() - t0, exc)
+        logger.warning("test_connection SQLAlchemy failed: %s", _friendly_error_text(exc))
         return False
     finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
+        if engine is not None:
+            engine.dispose()
