@@ -1,4 +1,4 @@
-# vers 1.04
+# vers 1.05
 import base64
 import email
 import html

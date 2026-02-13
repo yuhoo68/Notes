@@ -1,4 +1,4 @@
-# vers 1.04
+# vers 1.05
 from __future__ import annotations
 
 import base64
