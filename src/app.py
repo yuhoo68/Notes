@@ -1,4 +1,4 @@
-# vers: 1.05
+# vers: 1.04
 import importlib
 import logging
 import os
@@ -702,7 +702,7 @@ def get_sections(notebook_id: int | None) -> pd.DataFrame:
         """
         if notebook_id:
             query += f" WHERE notebook_id = {int(notebook_id)}"
-        query += " ORDER BY name"
+        query += " ORDER BY name DESC"
         return run_fetch_df(query)
 
     return _cached_df("cache_sections", params, _fetch)
@@ -1181,6 +1181,28 @@ def _build_refresh_context_signature(notebook_id: int, section_id: int, page_id:
                     ELSE 'section:none'
                 END,
                 CASE
+                    WHEN :page_id > 0 THEN COALESCE(
+                        (
+                            SELECT md5(
+                                COALESCE(n.id::text, '') || ':' ||
+                                COALESCE(n.name, '') || ':' ||
+                                COALESCE(n.department_id, '') || ':' ||
+                                COALESCE(to_char(n.updated_at, 'YYYY-MM-DD HH24:MI:SS.US'), '') || ':' ||
+                                COALESCE(s.id::text, '') || ':' ||
+                                COALESCE(s.name, '') || ':' ||
+                                COALESCE(to_char(s.updated_at, 'YYYY-MM-DD HH24:MI:SS.US'), '')
+                            )
+                            FROM {PAGES_TABLE} p
+                            JOIN {SECTIONS_TABLE} s ON s.id = p.section_id
+                            JOIN {NOTEBOOKS_TABLE} n ON n.id = s.notebook_id
+                            WHERE p.id = :page_id
+                            LIMIT 1
+                        ),
+                        'page-path:missing'
+                    )
+                    ELSE 'page-path:none'
+                END,
+                CASE
                     WHEN :section_id > 0 THEN COALESCE(
                         (
                             SELECT md5(
@@ -1290,22 +1312,23 @@ def _run_sidebar_sources_auto_refresh() -> None:
         ctx_ids_key = "_sidebar_sources_ctx_ids"
         sig_key = "_sidebar_sources_ctx_sig"
         expand_block_prev_key = "_sidebar_sources_expand_blocked_prev"
+        edit_expand_prev_key = "_sidebar_sources_edit_expand_prev_open"
 
         blocked_by_expanders = _is_expanders_auto_refresh_blocked()
         prev_expand_blocked = bool(st.session_state.get(expand_block_prev_key, False))
         st.session_state[expand_block_prev_key] = blocked_by_expanders
+        is_edit_expand_open = _is_expander_open("Редактировать страницу")
+        was_edit_expand_open = bool(st.session_state.get(edit_expand_prev_key, False))
+        st.session_state[edit_expand_prev_key] = is_edit_expand_open
+        edit_expand_just_closed = was_edit_expand_open and not is_edit_expand_open
 
         # После сворачивания expand-блоков запускаем проверку без ожидания полного интервала.
-        if prev_expand_blocked and not blocked_by_expanders:
+        if (prev_expand_blocked and not blocked_by_expanders) or edit_expand_just_closed:
             st.session_state[last_key] = 0.0
 
-        # Не запускаем автообновление, пока открыта одна из блокирующих модалок.
-        if (
-            st.session_state.get("edit_dialog_page_id") is not None
-            or st.session_state.get("append_dialog_page_id") is not None
-            or st.session_state.get("email_dialog_page_id") is not None
-            or blocked_by_expanders
-        ):
+        if edit_expand_just_closed:
+            _force_sidebar_sources_auto_refresh()
+            st.rerun()
             return
 
         last = float(st.session_state.get(last_key, 0.0))
@@ -1335,6 +1358,10 @@ def _run_sidebar_sources_auto_refresh() -> None:
             st.session_state[last_key] = now
             current_sig = _build_refresh_context_signature(*ctx_ids)
             if current_sig is None:
+                # fallback: если сигнатуру собрать не удалось, всё равно принудительно
+                # обновим источники, чтобы подтянуть внешние изменения.
+                _bump_sidebar_sources_version()
+                st.rerun()
                 return
 
             prev_sig = st.session_state.get(sig_key)
@@ -1359,30 +1386,50 @@ def _force_sidebar_sources_auto_refresh() -> None:
     st.session_state["_sidebar_sources_ctx_sig"] = _build_refresh_context_signature(*ctx_ids)
 
 
-AUTO_REFRESH_BLOCK_EXPANDER_LABELS = (
+AUTO_REFRESH_TRACK_EXPANDER_LABELS = (
     "Экспорт",
     "Редактировать страницу",
     "Прикрепить файлы",
     "Переместить или скопировать",
 )
 
+AUTO_REFRESH_BLOCK_EXPANDER_LABELS = (
+    "Экспорт",
+    "Прикрепить файлы",
+    "Переместить или скопировать",
+)
 
-def _is_expanders_auto_refresh_blocked() -> bool:
+
+def _read_expanders_state() -> dict[str, Any] | None:
     raw = st.session_state.get("_expanders_state_json", "")
     if not raw:
-        return False
+        return None
     try:
         data = json.loads(str(raw))
     except Exception:
-        return False
+        return None
     if not isinstance(data, dict):
-        return False
+        return None
     # Если мост перестал обновлять состояние, не держим автообновление заблокированным бесконечно.
     ts_ms = float(data.get("__ts", 0) or 0)
     now_ms = time.time() * 1000.0
     if ts_ms <= 0 or (now_ms - ts_ms) > 2500.0:
+        return None
+    return data
+
+
+def _is_expanders_auto_refresh_blocked() -> bool:
+    data = _read_expanders_state()
+    if not data:
         return False
     return any(bool(data.get(label, False)) for label in AUTO_REFRESH_BLOCK_EXPANDER_LABELS)
+
+
+def _is_expander_open(label: str) -> bool:
+    data = _read_expanders_state()
+    if not data:
+        return False
+    return bool(data.get(label, False))
 
 
 def _render_expanders_state_bridge() -> None:
@@ -1396,7 +1443,7 @@ def _render_expanders_state_bridge() -> None:
     )
     st.text_input("_expanders_state_json", key="_expanders_state_json", label_visibility="collapsed")
 
-    labels_json = json.dumps(list(AUTO_REFRESH_BLOCK_EXPANDER_LABELS), ensure_ascii=False)
+    labels_json = json.dumps(list(AUTO_REFRESH_TRACK_EXPANDER_LABELS), ensure_ascii=False)
     bridge_html = f"""
     <script>
     (function () {{
@@ -2377,8 +2424,15 @@ def main():
                     key=rename_key,
                 )
 
-                # ✅ кнопка переименована
-                submitted = st.form_submit_button("Сохранить")
+                # ✅ кнопки действий формы
+                save_col, cancel_col = st.columns(2)
+                with save_col:
+                    submitted = st.form_submit_button("Сохранить", use_container_width=True)
+                with cancel_col:
+                    canceled = st.form_submit_button("Отмена", use_container_width=True)
+
+                if canceled:
+                    st.rerun()
 
                 if submitted:
                     # 1) видимость
@@ -2489,6 +2543,9 @@ def main():
                         add_event_log(topic="SECTION", subtopic="DELETE",notebook_id=selected_notebook_id, section_id=section_id_local, page_id=0, event="saction_name = " + old_section_name, body_html="")
                         st.success("Раздел удалён")
                         st.rerun()
+
+            if st.button("Отмена", key=f"btn_cancel_section_manage_{section_id_local}", use_container_width=True):
+                st.rerun()
 
     # --- список разделов + кнопки ➕/✎ (вернули) ---
     sections_df = pd.DataFrame()
@@ -3087,6 +3144,9 @@ def main():
                             if st.button("Вставить в конец", key=f"replace_append_{page_id_local}", use_container_width=True):
                                 _handle_upload("append", "Содержимое файлов добавлено в конец страницы.")
 
+                    if st.button("Отмена", key=f"replace_cancel_{page_id_local}", use_container_width=True):
+                        st.rerun()
+
                 def _collapse_edit():
                     st.session_state[edit_nonce_key] += 1
 
@@ -3149,43 +3209,84 @@ def main():
 
                     title_key = f"page_title_input_{page_id}"
                     title_seed_key = f"{title_key}_seed"
-                    if st.session_state.get(title_seed_key) != (current_title or ""):
+                    tags_key = f"page_tags_input_{page_id}"
+                    tags_seed_key = f"{tags_key}_seed"
+                    edit_fields_context_key = "_edit_page_title_tags_context"
+                    cancel_reset_key = f"_cancel_title_tags_reset_{page_id}"
+                    current_edit_fields_context = int(page_id)
+
+                    if st.session_state.pop(cancel_reset_key, False):
                         st.session_state[title_key] = current_title or ""
                         st.session_state[title_seed_key] = current_title or ""
+                        st.session_state[tags_key] = current_tag or ""
+                        st.session_state[tags_seed_key] = current_tag or ""
+                        st.session_state[edit_fields_context_key] = current_edit_fields_context
+
+                    title_seed_val = st.session_state.get(title_seed_key)
+                    tags_seed_val = st.session_state.get(tags_seed_key)
+                    title_input_val = st.session_state.get(title_key)
+                    tags_input_val = st.session_state.get(tags_key)
+                    has_local_title_changes = title_input_val is not None and title_seed_val is not None and str(title_input_val) != str(title_seed_val)
+                    has_local_tags_changes = tags_input_val is not None and tags_seed_val is not None and str(tags_input_val) != str(tags_seed_val)
+                    has_local_unsaved_changes = has_local_title_changes or has_local_tags_changes
+
+                    should_seed_edit_fields = (
+                        st.session_state.get(edit_fields_context_key) != current_edit_fields_context
+                        or (
+                            not has_local_unsaved_changes
+                            and (
+                                title_seed_val != (current_title or "")
+                                or tags_seed_val != (current_tag or "")
+                            )
+                        )
+                    )
+                    if should_seed_edit_fields:
+                        st.session_state[title_key] = current_title or ""
+                        st.session_state[title_seed_key] = current_title or ""
+                        st.session_state[tags_key] = current_tag or ""
+                        st.session_state[tags_seed_key] = current_tag or ""
+                        st.session_state[edit_fields_context_key] = current_edit_fields_context
+
                     new_title_val = st.text_input(
                         "Наименование страницы",
                         key=title_key,
                     )
-                    tags_key = f"page_tags_input_{page_id}"
-                    tags_seed_key = f"{tags_key}_seed"
-                    if st.session_state.get(tags_seed_key) != (current_tag or ""):
-                        st.session_state[tags_key] = current_tag or ""
-                        st.session_state[tags_seed_key] = current_tag or ""
                     new_tags_val = st.text_input(
                         "Теги",
                         key=tags_key,
                     )
-                    if st.button(
-                        "Сохранить",
-                        key=f"save_title_tags_{page_id}",
-                        use_container_width=True,
-                    ):
-                        update_page(
-                            page_id,
-                            new_title_val.strip(),
-                            current_html or "",
-                            new_tags_val.strip(),
-                            current_page.get("status", ""),
-                        )
-                        _bump_data_version()
-                        st.session_state.pop(title_key, None)
-                        st.session_state.pop(title_seed_key, None)
-                        st.session_state.pop(tags_key, None)
-                        st.session_state.pop(tags_seed_key, None)
-                        st.session_state["current_page_id"] = page_id
-                        _collapse_edit()
-                        st.success("Наименование и теги обновлены")
-                        st.rerun()
+                    save_col, cancel_col = st.columns(2)
+                    with save_col:
+                        if st.button(
+                            "Сохранить",
+                            key=f"save_title_tags_{page_id}",
+                            use_container_width=True,
+                        ):
+                            update_page(
+                                page_id,
+                                new_title_val.strip(),
+                                current_html or "",
+                                new_tags_val.strip(),
+                                current_page.get("status", ""),
+                            )
+                            _bump_data_version()
+                            st.session_state.pop(title_key, None)
+                            st.session_state.pop(title_seed_key, None)
+                            st.session_state.pop(tags_key, None)
+                            st.session_state.pop(tags_seed_key, None)
+                            st.session_state["current_page_id"] = page_id
+                            _collapse_edit()
+                            st.success("Наименование и теги обновлены")
+                            st.rerun()
+                    with cancel_col:
+                        if st.button(
+                            "Отмена",
+                            key=f"cancel_title_tags_{page_id}",
+                            use_container_width=True,
+                        ):
+                            st.session_state[cancel_reset_key] = True
+                            _collapse_edit()
+                            st.rerun()
             else:
                 edit_nonce_key = f"edit_nonce_{page_id}"
                 st.session_state.setdefault(edit_nonce_key, 0)
@@ -3224,6 +3325,7 @@ def main():
                     save_files_clicked = st.button(
                         "Прикрепить файлы",
                         key=f"save_files_btn_{page_id}",
+                        use_container_width=True,
                     )
 
                     if save_files_clicked:
@@ -3261,6 +3363,13 @@ def main():
                             st.warning(str(exc))
                         except Exception as exc:
                             st.error(f"Ошибка при сохранении ссылки: {exc}")
+
+                    if st.button("Отмена", key=f"btn_cancel_attach_{page_id}", use_container_width=True):
+                        st.session_state[up_nonce_files_key] += 1
+                        st.session_state.pop(link_title_key, None)
+                        st.session_state.pop(link_url_key, None)
+                        st.session_state[exp_nonce_key] += 1
+                        st.rerun()
                 else:
                     st.caption("У вас нет прав на добавление файлов и ссылок.")
 

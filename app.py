@@ -702,7 +702,7 @@ def get_sections(notebook_id: int | None) -> pd.DataFrame:
         """
         if notebook_id:
             query += f" WHERE notebook_id = {int(notebook_id)}"
-        query += " ORDER BY name"
+        query += " ORDER BY name DESC"
         return run_fetch_df(query)
 
     return _cached_df("cache_sections", params, _fetch)
@@ -3144,6 +3144,9 @@ def main():
                             if st.button("Вставить в конец", key=f"replace_append_{page_id_local}", use_container_width=True):
                                 _handle_upload("append", "Содержимое файлов добавлено в конец страницы.")
 
+                    if st.button("Отмена", key=f"replace_cancel_{page_id_local}", use_container_width=True):
+                        st.rerun()
+
                 def _collapse_edit():
                     st.session_state[edit_nonce_key] += 1
 
@@ -3319,19 +3322,11 @@ def main():
                         key=uploader_key,
                     )
 
-                    save_files_col, cancel_files_col = st.columns(2)
-                    with save_files_col:
-                        save_files_clicked = st.button(
-                            "Прикрепить файлы",
-                            key=f"save_files_btn_{page_id}",
-                            use_container_width=True,
-                        )
-                    with cancel_files_col:
-                        cancel_files_clicked = st.button(
-                            "Отмена",
-                            key=f"cancel_files_btn_{page_id}",
-                            use_container_width=True,
-                        )
+                    save_files_clicked = st.button(
+                        "Прикрепить файлы",
+                        key=f"save_files_btn_{page_id}",
+                        use_container_width=True,
+                    )
 
                     if save_files_clicked:
                         if not uploaded_files:
@@ -3349,11 +3344,6 @@ def main():
                             except Exception as e:
                                 st.error(f"Ошибка при сохранении файлов: {e}")
 
-                    if cancel_files_clicked:
-                        st.session_state[up_nonce_files_key] += 1
-                        st.session_state[exp_nonce_key] += 1
-                        st.rerun()
-
                     st.markdown("---")
 
                     link_title_key = f"page_link_title_{page_id}"
@@ -3362,25 +3352,24 @@ def main():
                     link_title = st.text_input("Название для ссылки", key=link_title_key)
                     link_url = st.text_input("URL", key=link_url_key)
 
-                    save_link_col, cancel_link_col = st.columns(2)
-                    with save_link_col:
-                        if st.button("Сохранить ссылку", key=f"btn_save_link_{page_id}", use_container_width=True):
-                            question_number_val = st.session_state.get(question_number_key, "")
-                            try:
-                                save_link_attachment(page_id, link_url, link_title, selected_login, question_number_val)
-                                st.success("Ссылка сохранена")
-                                st.session_state[exp_nonce_key] += 1
-                                st.rerun()
-                            except ValueError as exc:
-                                st.warning(str(exc))
-                            except Exception as exc:
-                                st.error(f"Ошибка при сохранении ссылки: {exc}")
-                    with cancel_link_col:
-                        if st.button("Отмена", key=f"btn_cancel_link_{page_id}", use_container_width=True):
-                            st.session_state.pop(link_title_key, None)
-                            st.session_state.pop(link_url_key, None)
+                    if st.button("Сохранить ссылку", key=f"btn_save_link_{page_id}", use_container_width=True):
+                        question_number_val = st.session_state.get(question_number_key, "")
+                        try:
+                            save_link_attachment(page_id, link_url, link_title, selected_login, question_number_val)
+                            st.success("Ссылка сохранена")
                             st.session_state[exp_nonce_key] += 1
                             st.rerun()
+                        except ValueError as exc:
+                            st.warning(str(exc))
+                        except Exception as exc:
+                            st.error(f"Ошибка при сохранении ссылки: {exc}")
+
+                    if st.button("Отмена", key=f"btn_cancel_attach_{page_id}", use_container_width=True):
+                        st.session_state[up_nonce_files_key] += 1
+                        st.session_state.pop(link_title_key, None)
+                        st.session_state.pop(link_url_key, None)
+                        st.session_state[exp_nonce_key] += 1
+                        st.rerun()
                 else:
                     st.caption("У вас нет прав на добавление файлов и ссылок.")
 
